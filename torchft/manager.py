@@ -363,6 +363,10 @@ class Manager:
 
         self._update_fr_path()
 
+        # RAID5 intra-group fault tolerance handler
+        self._raid5_handler: Optional[Callable[[List[int]], None]] = None
+        self._prev_group_world_size: Optional[int] = None
+
     def allow_state_dict_read(self) -> None:
         if self._is_state_dict_read_allowed:
             return
@@ -397,6 +401,22 @@ class Manager:
             "`set_state_dict_fns` is deprecated, please use `register_state_dict_fn` instead"
         )
         self.register_state_dict_fn("set_state_dict_fns", load_state_dict, state_dict)
+
+    def register_raid5_handler(
+        self, handler: Callable[[List[int]], None]
+    ) -> None:
+        """
+        Register a RAID5 failure handler callback.
+
+        When the Manager detects an intra-group failure (world_size decreased),
+        this handler will be called with the list of failed ranks instead of
+        performing full checkpoint recovery from another replica group.
+
+        Args:
+            handler: callback that receives a list of failed intra-group ranks
+                and performs parity-based reconstruction + resharding.
+        """
+        self._raid5_handler = handler
 
     def shutdown(self, wait: bool = True) -> None:
         """
