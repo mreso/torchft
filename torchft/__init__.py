@@ -16,7 +16,7 @@ from torchft.process_group import (
     ProcessGroupNCCL,
     ProcessGroupXCCL,
 )
-from torchft.raid import RAID5FSDP
+from torchft.raid import ErasureCodingFSDP, RAID5FSDP
 
 setup_logger("torchft_quorums")
 setup_logger("torchft_commits")
@@ -32,5 +32,6 @@ __all__ = (
     "ProcessGroupBabyNCCL",
     "ProcessGroupBabyXCCL",
     "ProcessGroupGloo",
+    "ErasureCodingFSDP",
     "RAID5FSDP",
 )

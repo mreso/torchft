@@ -57,7 +57,7 @@ from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.tensor import init_device_mesh
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torchft import DistributedSampler, Manager, Optimizer, ProcessGroupGloo, ProcessGroupNCCL
-from torchft.raid import RAID5FSDP
+from torchft.raid import ErasureCodingFSDP, RAID5FSDP
 
 logging.basicConfig(level=logging.INFO)
 
@@ -66,6 +66,7 @@ def main() -> None:
     RANK = int(os.environ["RANK"])
     WORLD_SIZE = int(os.environ["WORLD_SIZE"])
     MASTER_PORT = os.environ.get("MASTER_PORT", "29500")
+    NUM_PARITY = int(os.environ.get("NUM_PARITY", "1"))
 
     # Each worker sees one GPU via CUDA_VISIBLE_DEVICES, mapped to device 0
     torch.cuda.set_device(0)
@@ -175,8 +176,8 @@ def main() -> None:
     num_params = sum(p.numel() for p in m.parameters())
     print(f"[Rank {RANK}] Total number of parameters: {num_params}")
 
-    # --- Training loop with RAID5 context ---
-    with RAID5FSDP(manager, m, raw_optimizer, fsdp_mesh, raid5_pg):
+    # --- Training loop with erasure-coded fault tolerance ---
+    with ErasureCodingFSDP(manager, m, raw_optimizer, fsdp_mesh, raid5_pg, num_parity=NUM_PARITY):
         while True:
             for inputs, labels in trainloader:
                 inputs = inputs.to(device)

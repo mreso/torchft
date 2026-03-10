@@ -5,14 +5,22 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-RAID5-Style Fault Tolerance for FSDP
-=====================================
+Erasure-Coded Fault Tolerance for FSDP
+=======================================
 
 This module implements intra-group fault tolerance for FSDP training using
-RAID5-style XOR parity. Each GPU stores a small parity buffer, and when one
-GPU dies, surviving GPUs reconstruct its data via XOR and reshard across N-1
-GPUs, eliminating the need for external checkpoint recovery for single-GPU
-failures.
+erasure coding. Each GPU stores parity syndrome stripes, and when GPUs fail,
+surviving GPUs reconstruct their data and reshard.
+
+Two levels of fault tolerance are provided:
+
+- **RAID5 / XOR parity (m=1):** single failure tolerance, 2/N overhead per GPU.
+  Uses simple XOR parity (``ParityManager`` / ``RAID5FSDP``).
+
+- **Reed-Solomon erasure coding (m>=1):** tolerate up to m simultaneous
+  GPU failures using m parity syndromes over GF(2^8). Memory overhead per GPU:
+  ``m*(m+1)/N`` of the protected data size. (``ErasureCodingManager`` /
+  ``ErasureCodingFSDP``).
 """
 
 import logging
@@ -309,6 +317,271 @@ class ParityManager:
         return result[: self._flat_size].clone()
 
 
+class ErasureCodingManager:
+    """
+    Reed-Solomon erasure coding manager for multi-failure fault tolerance.
+
+    Computes ``num_parity`` (m) syndromes over GF(2^8) using a Vandermonde
+    encoding matrix. Each syndrome is split into N stripes, and each rank
+    stores (m+1) consecutive stripe positions to tolerate up to m failures.
+
+    Syndrome computation:
+      ``S_j = XOR_{i=0}^{N-1}(gf_mul(g^(i*j), data_i))`` for j = 0..m-1
+
+    - j=0: S_0 = XOR(all data) (pure XOR, same as RAID5)
+    - j>=1: weighted GF(2^8) sums
+
+    Memory overhead per GPU: ``m * (m+1) * stripe_size`` bytes, where
+    stripe_size = ceil(flat_size / N). This gives m*(m+1)/N of the data size.
+
+    When m=1, this is equivalent to ``ParityManager`` (XOR parity, 2/N overhead).
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        device: torch.device,
+        num_parity: int = 1,
+    ) -> None:
+        if num_parity < 1:
+            raise ValueError(f"num_parity must be >= 1, got {num_parity}")
+        if world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {world_size}")
+        self._rank = rank
+        self._world_size = world_size
+        self._device = device
+        self._num_parity = num_parity
+
+        # Positions this rank stores for each syndrome: (m+1) consecutive
+        self._stored_positions = [
+            (rank + offset) % world_size for offset in range(num_parity + 1)
+        ]
+
+        # Stored syndrome stripes: shape [m, m+1, stripe_size] (set after compute)
+        self._stored_stripes: Optional[torch.Tensor] = None
+        self._stripe_size: int = 0
+        self._flat_size: int = 0
+
+    @property
+    def stripe_size(self) -> int:
+        return self._stripe_size
+
+    @property
+    def stored_stripes(self) -> Optional[torch.Tensor]:
+        return self._stored_stripes
+
+    def compute_parity(self, local_flat: torch.Tensor, pg: ProcessGroup) -> None:
+        """
+        Compute m erasure coding syndromes across all ranks.
+
+        Uses one allgather to collect all ranks' data, then computes m
+        syndromes locally. Each rank stores (m+1) stripes per syndrome.
+
+        Args:
+            local_flat: this rank's flat uint8 data buffer.
+            pg: the process group to use for communication.
+        """
+        from torchft.gf256 import GF_GENERATOR, gf_mul_vec, gf_pow
+
+        assert local_flat.dtype == torch.uint8
+
+        N = self._world_size
+        m = self._num_parity
+        self._flat_size = local_flat.numel()
+        self._stripe_size = math.ceil(self._flat_size / N)
+        padded_size = self._stripe_size * N
+
+        # Pad local data to uniform size
+        buf = torch.zeros(padded_size, dtype=torch.uint8, device=self._device)
+        buf[: self._flat_size].copy_(local_flat)
+
+        # Allgather all ranks' data
+        gathered = [
+            torch.zeros(padded_size, dtype=torch.uint8, device=self._device)
+            for _ in range(N)
+        ]
+        work = pg.allgather([gathered], [buf], AllgatherOptions())
+        work.wait()
+
+        # Compute m syndromes
+        # S_j = XOR_{i=0}^{N-1}(gf_mul(g^(i*j), data_i))
+        syndromes = torch.zeros(
+            m, padded_size, dtype=torch.uint8, device=self._device
+        )
+        for j in range(m):
+            for i in range(N):
+                coeff = gf_pow(GF_GENERATOR, i * j)
+                if coeff == 1:
+                    # j=0 always has coeff=1 (pure XOR); j>0 has coeff=1 for i=0
+                    syndromes[j] ^= gathered[i]
+                else:
+                    syndromes[j] ^= gf_mul_vec(coeff, gathered[i])
+
+        # Store (m+1) stripes per syndrome for this rank
+        num_stored = len(self._stored_positions)
+        self._stored_stripes = torch.zeros(
+            m, num_stored, self._stripe_size,
+            dtype=torch.uint8, device=self._device,
+        )
+        for j in range(m):
+            for s_idx, pos in enumerate(self._stored_positions):
+                start = pos * self._stripe_size
+                self._stored_stripes[j, s_idx] = syndromes[
+                    j, start : start + self._stripe_size
+                ]
+
+    def reconstruct(
+        self,
+        failed_ranks: List[int],
+        local_flat: torch.Tensor,
+        pg: ProcessGroup,
+    ) -> Dict[int, torch.Tensor]:
+        """
+        Reconstruct failed ranks' data from surviving data + parity syndromes.
+
+        Must be called only on surviving ranks. Uses k syndromes to recover
+        k failed ranks (k <= num_parity).
+
+        Algorithm:
+        1. Allgather stored stripes from survivors, reassemble k syndromes.
+        2. Allgather surviving data, compute residuals for each syndrome.
+        3. Build k×k Vandermonde submatrix, invert in GF(2^8).
+        4. Apply inverse to residuals to recover failed ranks' data.
+
+        Args:
+            failed_ranks: sorted list of ranks that died (len <= num_parity).
+            local_flat: this surviving rank's flat uint8 data buffer.
+            pg: process group configured with surviving ranks only.
+
+        Returns:
+            Dict mapping each failed rank to its reconstructed flat uint8 buffer.
+        """
+        from torchft.gf256 import (
+            GF_GENERATOR,
+            gf_matrix_inv,
+            gf_mul_vec,
+            gf_pow,
+        )
+
+        assert self._stored_stripes is not None, "must call compute_parity first"
+        assert local_flat.dtype == torch.uint8
+
+        k = len(failed_ranks)
+        m = self._num_parity
+        N = self._world_size
+        if k > m:
+            raise ValueError(
+                f"Cannot recover {k} failures with {m} parity syndromes"
+            )
+        if N < m + 1:
+            raise ValueError(
+                f"world_size ({N}) must be >= num_parity + 1 "
+                f"({m + 1}) to recover from failures"
+            )
+        if k == 0:
+            return {}
+
+        failed_set = set(failed_ranks)
+        new_world_size = N - k
+        padded_size = self._stripe_size * N
+
+        # -- Step 1: Allgather stored stripes from survivors --
+        # Each survivor sends its stored_stripes flattened
+        num_stored = len(self._stored_positions)
+        local_stripes_flat = self._stored_stripes.reshape(-1)
+        gathered_stripes = [
+            torch.zeros_like(local_stripes_flat) for _ in range(new_world_size)
+        ]
+        work = pg.allgather(
+            [gathered_stripes], [local_stripes_flat], AllgatherOptions()
+        )
+        work.wait()
+
+        # Identify surviving ranks in original ordering
+        surviving_ranks = [r for r in range(N) if r not in failed_set]
+
+        # Reassemble k syndromes (we use syndrome indices 0..k-1)
+        # Each survivor stored positions [(orig_rank + offset) % N for offset in 0..m]
+        syndromes = torch.zeros(
+            k, padded_size, dtype=torch.uint8, device=self._device
+        )
+        filled = [[False] * N for _ in range(k)]
+
+        for i, orig_rank in enumerate(surviving_ranks):
+            stripes_i = gathered_stripes[i].reshape(m, num_stored, self._stripe_size)
+            survivor_positions = [
+                (orig_rank + offset) % N for offset in range(num_stored)
+            ]
+            for j in range(k):
+                for s_idx, pos in enumerate(survivor_positions):
+                    if not filled[j][pos]:
+                        start = pos * self._stripe_size
+                        syndromes[j, start : start + self._stripe_size] = (
+                            stripes_i[j, s_idx]
+                        )
+                        filled[j][pos] = True
+
+        for j in range(k):
+            assert all(filled[j]), (
+                f"Syndrome {j} not fully recovered: {filled[j]}, "
+                f"failed_ranks={failed_ranks}"
+            )
+
+        # -- Step 2: Allgather surviving data, compute residuals --
+        surviving_buf = torch.zeros(
+            padded_size, dtype=torch.uint8, device=self._device
+        )
+        surviving_buf[: self._flat_size].copy_(local_flat)
+
+        gathered_data = [
+            torch.zeros(padded_size, dtype=torch.uint8, device=self._device)
+            for _ in range(new_world_size)
+        ]
+        work = pg.allgather(
+            [gathered_data], [surviving_buf], AllgatherOptions()
+        )
+        work.wait()
+
+        # Residual_j = S_j ^ contribution_of_surviving_ranks
+        # contribution_of_surviving for syndrome j = XOR of gf_mul(g^(i*j), data_i) for surviving i
+        residuals = syndromes.clone()
+        for idx, orig_rank in enumerate(surviving_ranks):
+            for j in range(k):
+                coeff = gf_pow(GF_GENERATOR, orig_rank * j)
+                if coeff == 1:
+                    residuals[j] ^= gathered_data[idx]
+                else:
+                    residuals[j] ^= gf_mul_vec(coeff, gathered_data[idx])
+
+        # -- Step 3: Build and invert k×k Vandermonde submatrix --
+        # Matrix[j][f_idx] = g^(failed_ranks[f_idx] * j)
+        vand_sub = [
+            [gf_pow(GF_GENERATOR, failed_ranks[f_idx] * j) for f_idx in range(k)]
+            for j in range(k)
+        ]
+        inv_matrix = gf_matrix_inv(vand_sub, k)
+
+        # -- Step 4: Apply inverse to residuals --
+        # data[failed_ranks[f_idx]] = XOR_{j=0}^{k-1}(gf_mul(inv[f_idx][j], residual_j))
+        result: Dict[int, torch.Tensor] = {}
+        for f_idx in range(k):
+            recovered = torch.zeros(
+                padded_size, dtype=torch.uint8, device=self._device
+            )
+            for j in range(k):
+                coeff = inv_matrix[f_idx][j]
+                if coeff == 0:
+                    continue
+                elif coeff == 1:
+                    recovered ^= residuals[j]
+                else:
+                    recovered ^= gf_mul_vec(coeff, residuals[j])
+            result[failed_ranks[f_idx]] = recovered[: self._flat_size].clone()
+
+        return result
+
+
 def _extract_local_tensor(t: torch.Tensor) -> torch.Tensor:
     """Extract the local tensor from a DTensor, or return the tensor itself."""
     if isinstance(t, DTensor):
@@ -316,22 +589,26 @@ def _extract_local_tensor(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
-class RAID5FSDP:
+class ErasureCodingFSDP:
     """
-    RAID5-style fault tolerance wrapper for FSDP training.
+    Erasure-coded fault tolerance wrapper for FSDP training.
 
     A context manager (following the LocalSGD/DiLoCo pattern) that integrates
-    with optimizer step hooks to maintain XOR parity of model parameters and
-    optimizer state. When a GPU fails, surviving GPUs can reconstruct the dead
-    rank's data and reshard across N-1 GPUs.
+    with optimizer step hooks to maintain erasure coding parity of model
+    parameters and optimizer state. When GPUs fail, surviving GPUs can
+    reconstruct the dead ranks' data and reshard.
+
+    With ``num_parity=1`` (default), this is equivalent to RAID5 XOR parity
+    (single failure tolerance). Higher values of ``num_parity`` use
+    Reed-Solomon erasure coding over GF(2^8) for multi-failure tolerance.
 
     Parity is computed asynchronously on a separate CUDA stream after each
     optimizer step, overlapping with the next step's forward pass.
 
     Usage::
 
-        raid5 = RAID5FSDP(manager, model, optimizer, fsdp_mesh, pg)
-        with raid5:
+        ec = ErasureCodingFSDP(manager, model, optimizer, fsdp_mesh, pg, num_parity=2)
+        with ec:
             for batch in dataloader:
                 optimizer.zero_grad()
                 loss = model(batch).sum()
@@ -346,6 +623,7 @@ class RAID5FSDP:
         optimizer: optim.Optimizer,
         fsdp_mesh: DeviceMesh,
         intra_group_pg: ProcessGroup,
+        num_parity: int = 1,
     ) -> None:
         """
         Args:
@@ -354,6 +632,8 @@ class RAID5FSDP:
             optimizer: The optimizer used for training.
             fsdp_mesh: The DeviceMesh used for FSDP sharding.
             intra_group_pg: The ProcessGroup for intra-replica-group communication.
+            num_parity: Number of parity syndromes (m). m=1 is RAID5/XOR,
+                m=2 tolerates 2 simultaneous failures, etc.
         """
         from torchft.manager import Manager
 
@@ -362,6 +642,7 @@ class RAID5FSDP:
         self._optimizer = optimizer
         self._fsdp_mesh = fsdp_mesh
         self._pg = intra_group_pg
+        self._num_parity = num_parity
 
         device = fsdp_mesh.device_type
         rank = fsdp_mesh.get_local_rank()
@@ -374,7 +655,9 @@ class RAID5FSDP:
         self._rank = rank
         self._world_size = world_size
 
-        self._parity_mgr = ParityManager(rank, world_size, self._device)
+        self._parity_mgr = ErasureCodingManager(
+            rank, world_size, self._device, num_parity
+        )
         self._flattener = StateFlattener()
 
         self._hooks: List[RemovableHandle] = []
@@ -390,7 +673,7 @@ class RAID5FSDP:
         # Track whether parity has been computed at least once
         self._parity_initialized = False
 
-    def __enter__(self) -> "RAID5FSDP":
+    def __enter__(self) -> "ErasureCodingFSDP":
         self._hooks.append(
             self._optimizer.register_step_post_hook(self._step_post_hook)
         )
@@ -478,15 +761,17 @@ class RAID5FSDP:
         Called by the Manager when an intra-group failure is detected.
 
         Args:
-            failed_ranks: list of ranks that failed (currently only single
-                failure is supported).
+            failed_ranks: sorted list of ranks that failed (up to num_parity).
         """
-        if len(failed_ranks) != 1:
+        if len(failed_ranks) > self._num_parity:
             raise ValueError(
-                f"RAID5 only supports single-failure recovery, got {len(failed_ranks)} failures"
+                f"Cannot recover {len(failed_ranks)} failures with "
+                f"{self._num_parity} parity syndromes"
             )
-        failed_rank = failed_ranks[0]
-        logger.info(f"RAID5: handling failure of rank {failed_rank}")
+        logger.info(
+            f"ErasureCoding(m={self._num_parity}): "
+            f"handling failure of ranks {failed_ranks}"
+        )
 
         # Ensure the last parity computation is complete
         self._ensure_parity_complete()
@@ -501,37 +786,43 @@ class RAID5FSDP:
         tensors = self._collect_protected_tensors()
         flat = self._flattener.flatten(tensors)
 
-        # Reconstruct the failed rank's data
-        reconstructed_flat = self._parity_mgr.reconstruct(failed_rank, flat, self._pg)
-        reconstructed_tensors = self._flattener.unflatten(reconstructed_flat)
+        # Reconstruct the failed ranks' data
+        reconstructed = self._parity_mgr.reconstruct(failed_ranks, flat, self._pg)
 
-        # Reshard across N-1 GPUs
-        self._reshard(reconstructed_tensors, failed_rank)
+        # Reshard across N-k GPUs
+        self._reshard_multi(reconstructed, failed_ranks)
 
         logger.info(
-            f"RAID5: recovery complete, now running on {self._world_size} GPUs"
+            f"ErasureCoding: recovery complete, now running on "
+            f"{self._world_size} GPUs"
         )
 
-    def _reshard(
-        self, reconstructed_tensors: List[torch.Tensor], failed_rank: int
+    def _reshard_multi(
+        self,
+        reconstructed: Dict[int, torch.Tensor],
+        failed_ranks: List[int],
     ) -> None:
         """
-        Redistribute model parameters and optimizer state across N-1 GPUs
-        after reconstructing a failed rank's data.
+        Redistribute model parameters and optimizer state across N-k GPUs
+        after reconstructing failed ranks' data.
 
         Args:
-            reconstructed_tensors: the failed rank's tensors (same order as
-                _collect_protected_tensors produces).
-            failed_rank: the rank that failed.
+            reconstructed: dict mapping each failed rank to its reconstructed
+                flat uint8 buffer.
+            failed_ranks: sorted list of ranks that failed.
         """
+        failed_set = set(failed_ranks)
         old_world_size = self._world_size
+        k = len(failed_ranks)
+        new_world_size = old_world_size - k
 
-        # Compute new rank: ranks above failed_rank shift down by 1
-        new_world_size = old_world_size - 1
-        if self._rank > failed_rank:
-            new_rank = self._rank - 1
-        else:
-            new_rank = self._rank
+        # Compute new rank: shift down by the count of failed ranks below this one
+        new_rank = self._rank - sum(1 for f in failed_ranks if f < self._rank)
+
+        # Unflatten reconstructed data for each failed rank
+        reconstructed_tensors: Dict[int, List[torch.Tensor]] = {}
+        for fr, flat_data in reconstructed.items():
+            reconstructed_tensors[fr] = self._flattener.unflatten(flat_data)
 
         # Split reconstructed tensors in the same order as _collect_protected_tensors
         recon_idx = 0
@@ -539,14 +830,16 @@ class RAID5FSDP:
         # Reshard model parameters
         for param in self._model.parameters():
             local_p = _extract_local_tensor(param.data)
-            recon_p = reconstructed_tensors[recon_idx]
+            recon_shards = {
+                fr: reconstructed_tensors[fr][recon_idx] for fr in failed_ranks
+            }
             recon_idx += 1
 
-            new_shard = self._reshard_parameter(
-                local_p, recon_p, failed_rank, old_world_size, new_rank, new_world_size
+            new_shard = self._reshard_parameter_multi(
+                local_p, recon_shards, failed_ranks, old_world_size,
+                new_rank, new_world_size,
             )
 
-            # Update parameter in-place
             if isinstance(param.data, DTensor):
                 param.data._local_tensor.copy_(new_shard)
             else:
@@ -560,16 +853,15 @@ class RAID5FSDP:
             for key in ("exp_avg", "exp_avg_sq"):
                 if key in state:
                     local_t = _extract_local_tensor(state[key])
-                    recon_t = reconstructed_tensors[recon_idx]
+                    recon_shards = {
+                        fr: reconstructed_tensors[fr][recon_idx]
+                        for fr in failed_ranks
+                    }
                     recon_idx += 1
 
-                    new_shard = self._reshard_parameter(
-                        local_t,
-                        recon_t,
-                        failed_rank,
-                        old_world_size,
-                        new_rank,
-                        new_world_size,
+                    new_shard = self._reshard_parameter_multi(
+                        local_t, recon_shards, failed_ranks, old_world_size,
+                        new_rank, new_world_size,
                     )
 
                     if isinstance(state[key], DTensor):
@@ -577,18 +869,19 @@ class RAID5FSDP:
                     else:
                         state[key].copy_(new_shard)
 
-        # Update internal state for N-1 configuration
+        # Update internal state for N-k configuration
         self._rank = new_rank
         self._world_size = new_world_size
 
-        # Build new DeviceMesh excluding the failed rank
+        # Build new DeviceMesh excluding the failed ranks
         old_mesh_1d = self._fsdp_mesh.mesh.tolist()
         if isinstance(old_mesh_1d[0], list):
-            # multi-dim mesh, flatten to get device IDs
             raise NotImplementedError(
                 "Multi-dimensional mesh resharding not yet supported"
             )
-        surviving_devices = [d for i, d in enumerate(old_mesh_1d) if i != failed_rank]
+        surviving_devices = [
+            d for i, d in enumerate(old_mesh_1d) if i not in failed_set
+        ]
         new_mesh = DeviceMesh(
             self._fsdp_mesh.device_type,
             surviving_devices,
@@ -605,17 +898,19 @@ class RAID5FSDP:
                     placements=param.data._spec.placements,
                 )
 
-        # Update ParityManager for the new configuration
-        self._parity_mgr = ParityManager(new_rank, new_world_size, self._device)
+        # Update ErasureCodingManager for the new configuration
+        self._parity_mgr = ErasureCodingManager(
+            new_rank, new_world_size, self._device, self._num_parity
+        )
 
-        # Recompute parity for N-1 configuration
+        # Recompute parity for N-k configuration
         self._do_update_parity()
 
-    def _reshard_parameter(
+    def _reshard_parameter_multi(
         self,
         local_shard: torch.Tensor,
-        reconstructed_shard: torch.Tensor,
-        failed_rank: int,
+        reconstructed_shards: Dict[int, torch.Tensor],
+        failed_ranks: List[int],
         old_world_size: int,
         new_rank: int,
         new_world_size: int,
@@ -623,20 +918,22 @@ class RAID5FSDP:
         """
         Reshard a single parameter/state tensor from old_world_size to new_world_size.
 
-        Each surviving rank has its own shard and the reconstructed shard for the
-        failed rank. We allgather all shards, form the full tensor, and re-chunk.
+        Each surviving rank has its own shard and the reconstructed shards for
+        failed ranks. We allgather surviving shards, form the full tensor, re-chunk.
 
         Args:
             local_shard: this rank's current shard.
-            reconstructed_shard: the dead rank's shard (just reconstructed).
-            failed_rank: rank that failed.
+            reconstructed_shards: dict of {failed_rank: reconstructed_shard}.
+            failed_ranks: sorted list of failed ranks.
             old_world_size: previous world size.
-            new_rank: this rank's new index in the N-1 group.
-            new_world_size: new world size (N-1).
+            new_rank: this rank's new index in the N-k group.
+            new_world_size: new world size (N-k).
 
         Returns:
             The new local shard for this rank.
         """
+        failed_set = set(failed_ranks)
+
         # Allgather surviving shards
         gathered = [torch.zeros_like(local_shard) for _ in range(new_world_size)]
         opts = AllgatherOptions()
@@ -647,8 +944,8 @@ class RAID5FSDP:
         all_shards: List[torch.Tensor] = []
         surviving_idx = 0
         for old_rank in range(old_world_size):
-            if old_rank == failed_rank:
-                all_shards.append(reconstructed_shard)
+            if old_rank in failed_set:
+                all_shards.append(reconstructed_shards[old_rank])
             else:
                 all_shards.append(gathered[surviving_idx])
                 surviving_idx += 1
@@ -656,14 +953,15 @@ class RAID5FSDP:
         # Concatenate to form the full (unsharded) tensor
         full_tensor = torch.cat([s.flatten() for s in all_shards])
 
-        # Re-chunk for N-1 GPUs
+        # Re-chunk for N-k GPUs
         chunks = full_tensor.chunk(new_world_size)
         new_shard = chunks[new_rank].clone()
 
         # Reshape to match expected shard shape
-        # After rechunking the shard may have a different shape
         return new_shard.reshape(
-            self._compute_new_shard_shape(local_shard.shape, old_world_size, new_world_size)
+            self._compute_new_shard_shape(
+                local_shard.shape, old_world_size, new_world_size
+            )
         )
 
     @staticmethod
@@ -685,3 +983,66 @@ class RAID5FSDP:
         full_dim0 = old_shard_shape[0] * old_world_size
         new_dim0 = math.ceil(full_dim0 / new_world_size)
         return torch.Size([new_dim0] + list(old_shard_shape[1:]))
+
+
+class RAID5FSDP(ErasureCodingFSDP):
+    """
+    RAID5-style fault tolerance wrapper for FSDP training.
+
+    Backward-compatible alias for ``ErasureCodingFSDP(num_parity=1)``.
+
+    A context manager (following the LocalSGD/DiLoCo pattern) that integrates
+    with optimizer step hooks to maintain XOR parity of model parameters and
+    optimizer state. When a GPU fails, surviving GPUs can reconstruct the dead
+    rank's data and reshard across N-1 GPUs.
+
+    Parity is computed asynchronously on a separate CUDA stream after each
+    optimizer step, overlapping with the next step's forward pass.
+
+    Usage::
+
+        raid5 = RAID5FSDP(manager, model, optimizer, fsdp_mesh, pg)
+        with raid5:
+            for batch in dataloader:
+                optimizer.zero_grad()
+                loss = model(batch).sum()
+                loss.backward()
+                optimizer.step()
+    """
+
+    def __init__(
+        self,
+        manager: "Manager",
+        model: nn.Module,
+        optimizer: optim.Optimizer,
+        fsdp_mesh: DeviceMesh,
+        intra_group_pg: ProcessGroup,
+    ) -> None:
+        """
+        Args:
+            manager: The torchft Manager for fault tolerance coordination.
+            model: The FSDP-wrapped model.
+            optimizer: The optimizer used for training.
+            fsdp_mesh: The DeviceMesh used for FSDP sharding.
+            intra_group_pg: The ProcessGroup for intra-replica-group communication.
+        """
+        super().__init__(
+            manager, model, optimizer, fsdp_mesh, intra_group_pg, num_parity=1
+        )
+
+    def handle_failure(self, failed_ranks: List[int]) -> None:
+        """
+        Reconstruct dead rank data, reshard model+optimizer, reconfigure PG.
+
+        Called by the Manager when an intra-group failure is detected.
+
+        Args:
+            failed_ranks: list of ranks that failed (only single failure
+                supported for RAID5).
+        """
+        if len(failed_ranks) != 1:
+            raise ValueError(
+                f"RAID5 only supports single-failure recovery, "
+                f"got {len(failed_ranks)} failures"
+            )
+        super().handle_failure(failed_ranks)

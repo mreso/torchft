@@ -154,6 +154,7 @@ def start_workers(
     lighthouse_port: int,
     gpu_ids: List[int],
     monitor: OutputMonitor,
+    num_parity: int = 1,
 ) -> Dict[int, subprocess.Popen]:
     """Start worker processes and begin monitoring their output."""
     workers: Dict[int, subprocess.Popen] = {}
@@ -168,6 +169,7 @@ def start_workers(
             "MASTER_PORT": str(master_port),
             "CUDA_VISIBLE_DEVICES": str(gpu_ids[rank]),
             "TORCHFT_LIGHTHOUSE": f"http://localhost:{lighthouse_port}",
+            "NUM_PARITY": str(num_parity),
             # Reduce NCCL timeout for faster failure detection in the demo
             "TORCH_NCCL_NONBLOCKING_TIMEOUT": "30",
             "NCCL_TIMEOUT": "30",
@@ -240,6 +242,7 @@ def main() -> None:
     parser.add_argument("--steps_after_kill", type=int, default=10, help="Steps to run with N-1 workers")
     parser.add_argument("--steps_after_rejoin", type=int, default=10, help="Steps after adding worker back")
     parser.add_argument("--kill_rank", type=int, default=None, help="Rank to kill (default: last)")
+    parser.add_argument("--num_parity", type=int, default=1, help="Number of parity syndromes (m=1: RAID5, m=2: dual parity, etc.)")
     args = parser.parse_args()
 
     N = args.num_workers
@@ -270,7 +273,7 @@ def main() -> None:
         lighthouse = start_lighthouse(lighthouse_port)
         master_port = find_free_port()
 
-        workers = start_workers(N, master_port, lighthouse_port, gpu_ids, monitor)
+        workers = start_workers(N, master_port, lighthouse_port, gpu_ids, monitor, args.num_parity)
 
         print(f"\n[orchestrator] Waiting for workers to reach step {args.steps_before_kill}...")
         reached = monitor.wait_for_step(args.steps_before_kill, timeout=180.0)
@@ -312,7 +315,7 @@ def main() -> None:
         surviving_gpus = [g for i, g in enumerate(gpu_ids) if i != kill_rank]
         master_port = find_free_port()
 
-        workers = start_workers(N - 1, master_port, lighthouse_port, surviving_gpus, monitor)
+        workers = start_workers(N - 1, master_port, lighthouse_port, surviving_gpus, monitor, args.num_parity)
 
         target_step = args.steps_after_kill
         print(f"[orchestrator] Waiting for {N - 1} workers to reach step {target_step}...")
@@ -336,7 +339,7 @@ def main() -> None:
         print(f"{'='*70}\n")
 
         master_port = find_free_port()
-        workers = start_workers(N, master_port, lighthouse_port, gpu_ids, monitor)
+        workers = start_workers(N, master_port, lighthouse_port, gpu_ids, monitor, args.num_parity)
 
         target_step = args.steps_after_rejoin
         print(f"[orchestrator] Waiting for {N} workers to reach step {target_step}...")
@@ -352,7 +355,8 @@ def main() -> None:
         print("DEMO COMPLETE")
         print(f"{'='*70}")
         print()
-        print("Summary:")
+        parity_desc = "RAID5/XOR" if args.num_parity == 1 else f"Reed-Solomon (m={args.num_parity})"
+        print(f"Summary (parity: {parity_desc}):")
         print(f"  1. Trained with {N} workers for {args.steps_before_kill} steps")
         print(f"  2. Killed worker rank={kill_rank} (simulated GPU failure)")
         print(f"  3. Remaining workers detected failure and exited")
