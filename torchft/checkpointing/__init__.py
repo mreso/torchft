@@ -12,9 +12,11 @@ This module implements methods for checkpointing and resuming training from a ch
 """
 
 from torchft.checkpointing.http_transport import HTTPTransport
+from torchft.checkpointing.rdma_transport import RDMATransport
 from torchft.checkpointing.transport import CheckpointTransport
 
 __all__ = [
     "HTTPTransport",
+    "RDMATransport",
     "CheckpointTransport",
 ]
