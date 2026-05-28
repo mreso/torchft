@@ -359,61 +359,52 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         """Probe whether GPUDirect RDMA registration works for this device.
 
         Returns ``True`` (GDR usable) for non-cuda devices unconditionally —
-        there is nothing to probe and pinned-CPU staging is irrelevant. For a
-        cuda device, allocate a tiny CUDA tensor, attempt to register it with
-        ``RdmaMemory`` and exercise a tiny loopback self-read; any exception
-        means GDR is not usable here. On failure the transport routes ALL GPU
-        tensors through the pinned-CPU staging path (see ``_build_snapshot``)
-        so checkpoints still work, just without zero-copy GPU transfers.
+        there is nothing to probe and pinned-CPU staging is irrelevant.
 
-        The chosen mode is logged so sender and receiver operators can confirm
-        the path that was taken.
+        For a cuda device the probe is **registration-only**: it allocates a
+        tiny CUDA tensor and attempts ``RdmaMemory(t)``. Registration is the
+        load-bearing signal — it is exactly what ``_build_snapshot`` does for
+        every GPU tensor, and it is what fails first when GDR is unavailable
+        (IB NIC present, GPUDirect path not usable for this GPU/NIC/driver).
+
+        We deliberately do **not** attempt a self-loopback ``connect()`` +
+        ``read()`` here: torchcomms ``connect()`` expects a *separate* peer
+        connecting from the other end (server/client each ``bind()`` then
+        ``connect()`` to the other's URL), so pointing a transport at its own
+        bind address has no second endpoint and can block indefinitely rather
+        than raise — which would wedge ``__init__`` on every GPU node. A real
+        end-to-end GPU read is validated by the hardware test
+        (``examples/rdma_transport_sim.py --real --device cuda``), not at
+        construction time.
+
+        On registration failure the transport routes ALL GPU tensors through
+        the pinned-CPU staging path (see ``_build_snapshot``) so checkpoints
+        still work, just without zero-copy GPU transfers. The chosen mode is
+        logged so operators can confirm the path that was taken.
         """
         if self._device.type != "cuda":
             return True
 
         from torchcomms._transport import (  # type: ignore[import-not-found]
             RdmaMemory,
-            RdmaTransport,
         )
 
         try:
             probe_tensor = torch.zeros(8, dtype=torch.uint8, device=self._device)
-            probe_mem = RdmaMemory(probe_tensor, cache_reg=False)
-            # Best-effort tiny loopback self-read: register a destination,
-            # bind/connect a transport to itself, and read our own buffer back.
-            # If the binding cannot drive a GPU read this raises and we fall
-            # back. Any failure (including from the bind/connect not being
-            # self-loopback capable) is treated conservatively as "GDR not
-            # confirmed" -> stage through pinned CPU.
-            try:
-                dst_tensor = torch.zeros(8, dtype=torch.uint8, device=self._device)
-                dst_mem = RdmaMemory(dst_tensor, cache_reg=False)
-                probe_transport = RdmaTransport(self._device)
-                addr = probe_transport.bind()
-                # pyre-ignore[16]
-                probe_transport.connect(addr)
-                _rdma_read(
-                    probe_transport,
-                    dst_mem.to_mutable_view(),
-                    probe_mem.to_remote_buffer(),
-                )
-            except Exception as loop_e:
-                logger.warning(
-                    "RDMATransport GDR loopback self-read probe failed (%r); "
-                    "registration succeeded so treating GDR as usable",
-                    loop_e,
-                )
+            # Register and immediately drop it. Success means GDR registration
+            # works for this device; that is the only thing we assert here.
+            RdmaMemory(probe_tensor, cache_reg=False)
             logger.info(
-                "RDMATransport GDR probe succeeded on %s; GPU tensors stay on "
-                "GPU (subject to max_gpu_snapshot_bytes)",
+                "RDMATransport GDR registration probe succeeded on %s; GPU "
+                "tensors stay on GPU (subject to max_gpu_snapshot_bytes)",
                 self._device,
             )
             return True
         except Exception as e:
             logger.warning(
-                "RDMATransport GDR probe FAILED on %s (%r); routing ALL GPU "
-                "tensors through pinned-CPU staging for checkpoints",
+                "RDMATransport GDR registration probe FAILED on %s (%r); "
+                "routing ALL GPU tensors through pinned-CPU staging for "
+                "checkpoints",
                 self._device,
                 e,
             )
