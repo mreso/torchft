@@ -2261,3 +2261,394 @@ class TestRDMAGpuSnapshotSpill(_RDMAMockBase):
             self.assertEqual(len(snap.tensor_snapshots), 3)
         finally:
             transport.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# B1: GPU snapshot must be synchronized before RDMA exposure.
+#
+# These tests fake ``torch.cuda`` (Stream / Event / current_stream / stream)
+# with recorders so the CUDA branches of ``_build_snapshot`` /
+# ``send_checkpoint`` run on a machine with no GPU. The single assertion that
+# matters: the snapshot's copy-stream event is waited on (synchronized) BEFORE
+# the control record is flipped to READY. If the synchronization is removed,
+# these tests fail.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCudaEvent:
+    """Records ``record()`` / ``synchronize()`` against a shared call log."""
+
+    def __init__(self, log: List[str]) -> None:
+        self._log = log
+        self.recorded = False
+        self.synchronized = False
+
+    def record(self, stream: object = None) -> None:
+        self.recorded = True
+        self._log.append("event.record")
+
+    def synchronize(self) -> None:
+        self.synchronized = True
+        self._log.append("event.synchronize")
+
+
+class _FakeCudaStream:
+    """Stand-in for ``torch.cuda.Stream`` used by the copy-stream path."""
+
+    def __init__(self, log: List[str]) -> None:
+        self._log = log
+
+    def wait_stream(self, other: object) -> None:
+        self._log.append("stream.wait_stream")
+
+    def synchronize(self) -> None:
+        self._log.append("stream.synchronize")
+
+
+class _FakeCudaModule:
+    """Minimal fake of ``torch.cuda`` that records the ordering of operations.
+
+    Only the entry points touched by the RDMA snapshot path are implemented:
+    ``Stream``, ``Event``, ``current_stream``, and the ``stream(...)`` context
+    manager. Every interesting call appends to ``log`` so a test can assert
+    the relative order of the copy-stream fence and the READY publish.
+    """
+
+    def __init__(self) -> None:
+        self.log: List[str] = []
+        self.events: List[_FakeCudaEvent] = []
+
+    def Stream(self) -> _FakeCudaStream:  # noqa: N802 - mirrors torch API
+        return _FakeCudaStream(self.log)
+
+    def Event(self) -> _FakeCudaEvent:  # noqa: N802 - mirrors torch API
+        ev = _FakeCudaEvent(self.log)
+        self.events.append(ev)
+        return ev
+
+    def current_stream(self) -> _FakeCudaStream:
+        return _FakeCudaStream(self.log)
+
+    def stream(self, stream: object) -> "object":
+        log = self.log
+
+        class _Ctx:
+            def __enter__(self_inner) -> object:
+                log.append("stream.enter")
+                return stream
+
+            def __exit__(self_inner, *exc: object) -> bool:
+                log.append("stream.exit")
+                return False
+
+        return _Ctx()
+
+
+class TestRDMAGpuSnapshotSyncBeforePublish(_RDMAMockBase):
+    """B1: the snapshot's CUDA work is fenced before the READY publish."""
+
+    def _make_cuda_transport(
+        self, fake_cuda: _FakeCudaModule
+    ) -> "RDMATransport":
+        """Build a transport that believes its device is CUDA.
+
+        ``pin_memory=True`` allocations and ``torch.cuda`` calls are routed to
+        fakes so the CUDA branches execute on a CPU-only host.
+        """
+        import torch as _torch
+        from torchft.checkpointing import rdma_transport as mod
+
+        real_zeros = _torch.zeros
+        real_empty = _torch.empty
+
+        def zeros_no_pin(*args: object, **kwargs: object) -> "_torch.Tensor":
+            kwargs.pop("pin_memory", None)
+            return real_zeros(*args, **kwargs)
+
+        def empty_no_pin(*args: object, **kwargs: object) -> "_torch.Tensor":
+            kwargs.pop("pin_memory", None)
+            return real_empty(*args, **kwargs)
+
+        self._patches = [
+            patch.object(mod.torch, "cuda", fake_cuda),
+            patch.object(mod.torch, "zeros", side_effect=zeros_no_pin),
+            patch.object(mod.torch, "empty", side_effect=empty_no_pin),
+        ]
+        for p in self._patches:
+            p.start()
+        try:
+            return RDMATransport(
+                device=torch.device("cuda:0"),
+                timeout=timedelta(seconds=10),
+                max_gpu_snapshot_bytes=1 << 30,
+            )
+        except Exception:
+            for p in self._patches:
+                p.stop()
+            raise
+
+    def _teardown_patches(self) -> None:
+        for p in getattr(self, "_patches", []):
+            p.stop()
+        self._patches = []
+
+    def test_event_synchronize_precedes_ready_publish(self) -> None:
+        fake_cuda = _FakeCudaModule()
+        transport = self._make_cuda_transport(fake_cuda)
+        try:
+            from torchft.checkpointing import rdma_transport as mod
+
+            # Drive the CUDA path: ``_prepare_state_dict`` returns CUDA-like
+            # tensors plus matching metadata.
+            tensors = [_FakeCudaTensor(256), _FakeCudaTensor(128)]
+            sd_meta = _make_cuda_only_state_dict_meta([256, 128])
+
+            # Mark the publish point in the shared call log so we can assert it
+            # happens strictly after the event synchronize.
+            real_update = transport._update_control_record
+
+            def logging_update(step: int, status: str, snapshot: object) -> None:
+                if status == "READY":
+                    fake_cuda.log.append("control.READY")
+                return real_update(step, status, snapshot)
+
+            with patch.object(
+                mod, "_prepare_state_dict", return_value=(sd_meta, tensors)
+            ), patch.object(
+                transport, "_update_control_record", side_effect=logging_update
+            ):
+                transport.send_checkpoint(
+                    dst_ranks=[1],
+                    step=7,
+                    state_dict={"unused": 0},
+                    timeout=timedelta(seconds=10),
+                )
+
+            log = fake_cuda.log
+            self.assertIn("event.synchronize", log)
+            self.assertIn("control.READY", log)
+            # The fence must come before the READY publish.
+            self.assertLess(
+                log.index("event.synchronize"),
+                log.index("control.READY"),
+                f"event must be synchronized before READY publish; log={log}",
+            )
+            # The event recorded on the snapshot was actually synchronized.
+            self.assertEqual(len(fake_cuda.events), 1)
+            self.assertTrue(fake_cuda.events[0].recorded)
+            self.assertTrue(fake_cuda.events[0].synchronized)
+        finally:
+            self._teardown_patches()
+            transport.shutdown()
+
+    def test_copy_stream_waits_on_producer_stream(self) -> None:
+        """The copy stream waits on the producer stream before copies start."""
+        fake_cuda = _FakeCudaModule()
+        transport = self._make_cuda_transport(fake_cuda)
+        try:
+            from torchft.checkpointing import rdma_transport as mod
+
+            tensors = [_FakeCudaTensor(64)]
+            sd_meta = _make_cuda_only_state_dict_meta([64])
+            with patch.object(
+                mod, "_prepare_state_dict", return_value=(sd_meta, tensors)
+            ):
+                snap = transport._build_snapshot(sd_meta, tensors, step=1)
+
+            log = fake_cuda.log
+            # Ordering inside _build_snapshot: wait on producer stream, enter
+            # the copy-stream context, then record the fence event.
+            self.assertIn("stream.wait_stream", log)
+            self.assertIn("event.record", log)
+            self.assertLess(
+                log.index("stream.wait_stream"), log.index("event.record")
+            )
+            self.assertIsNotNone(snap.cuda_event)
+        finally:
+            self._teardown_patches()
+            transport.shutdown()
+
+    def test_removing_sync_would_break_invariant(self) -> None:
+        """Guard test: if ``_wait_snapshot_ready`` no-ops, READY precedes sync.
+
+        This pins the regression the B1 fix guards against. We monkeypatch the
+        wait to do nothing (simulating the unfixed code) and assert that the
+        synchronize no longer precedes the READY publish — proving the primary
+        test above is actually exercising the synchronization.
+        """
+        fake_cuda = _FakeCudaModule()
+        transport = self._make_cuda_transport(fake_cuda)
+        try:
+            from torchft.checkpointing import rdma_transport as mod
+
+            tensors = [_FakeCudaTensor(32)]
+            sd_meta = _make_cuda_only_state_dict_meta([32])
+
+            real_update = transport._update_control_record
+
+            def logging_update(step: int, status: str, snapshot: object) -> None:
+                if status == "READY":
+                    fake_cuda.log.append("control.READY")
+                return real_update(step, status, snapshot)
+
+            with patch.object(
+                mod, "_prepare_state_dict", return_value=(sd_meta, tensors)
+            ), patch.object(
+                transport, "_update_control_record", side_effect=logging_update
+            ), patch.object(
+                transport, "_wait_snapshot_ready", return_value=None
+            ):
+                transport.send_checkpoint(
+                    dst_ranks=[1],
+                    step=3,
+                    state_dict={"unused": 0},
+                    timeout=timedelta(seconds=10),
+                )
+
+            log = fake_cuda.log
+            # With the sync removed, no synchronize was issued before READY.
+            self.assertIn("control.READY", log)
+            ready_idx = log.index("control.READY")
+            self.assertNotIn("event.synchronize", log[:ready_idx])
+        finally:
+            self._teardown_patches()
+            transport.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# B6: control-record publication atomicity.
+#
+# The control buffer is published payload-first, length-last; the length word
+# is the commit point. A reader observing a mid-write buffer must decode either
+# the previous record or the new one, never a torn mix.
+# ---------------------------------------------------------------------------
+
+
+class TestRDMAControlRecordAtomicity(_RDMAMockBase):
+    """B6: publication is atomic at the length-commit boundary."""
+
+    def _decode(self, buf: "torch.Tensor") -> Optional[_RDMAControlRecord]:
+        """Decode the control buffer the way ``_read_control_record`` does.
+
+        Returns ``None`` when length==0 (the "not yet committed" signal),
+        otherwise the decoded record. Raises if the bytes are torn — which is
+        exactly what must never be observed.
+        """
+        view = buf.numpy()
+        (length,) = struct.unpack_from("<Q", view, 0)
+        if length == 0:
+            return None
+        rec = pickle.loads(bytes(view[8 : 8 + length]))
+        assert isinstance(rec, _RDMAControlRecord)
+        return rec
+
+    def test_length_is_committed_last(self) -> None:
+        """The length word is written after the payload (commit-last order)."""
+        transport = self._new_transport()
+        try:
+            # Publish an initial record so the buffer holds a known good record.
+            transport.send_checkpoint(
+                dst_ranks=[1],
+                step=1,
+                state_dict={"t": torch.tensor([1.0])},
+                timeout=timedelta(seconds=10),
+            )
+            old_rec = self._read_control(transport)
+            self.assertEqual(old_rec.status, "READY")
+            self.assertEqual(old_rec.step, 1)
+
+            # Capture the byte-write order by recording every store to offset 0
+            # (the length word) vs. the payload region. We intercept numpy
+            # ``struct.pack_into`` via a wrapper on the control tensor.
+            order: List[str] = []
+            real_pack_into = struct.pack_into
+
+            def tracking_pack_into(fmt: str, buf: object, offset: int, *vals: object):
+                if offset == 0:
+                    order.append(f"len={vals[0]}")
+                return real_pack_into(fmt, buf, offset, *vals)
+
+            import torchft.checkpointing.rdma_transport as mod
+
+            with patch.object(mod.struct, "pack_into", side_effect=tracking_pack_into):
+                transport.disallow_checkpoint()
+
+            # disallow writes a DISALLOWED record: length is first zeroed, then
+            # written non-zero LAST (after the payload copy in between).
+            self.assertEqual(order[0], "len=0", f"length not cleared first: {order}")
+            self.assertNotEqual(
+                order[-1], "len=0", f"length not committed last: {order}"
+            )
+            self.assertEqual(self._read_control(transport).status, "DISALLOWED")
+        finally:
+            transport.shutdown()
+
+    def test_concurrent_reader_never_sees_torn_record(self) -> None:
+        """A reader polling during repeated publishes only sees whole records.
+
+        A background thread hammers the control buffer with alternating
+        publishes while the main thread decodes it in a tight loop. Every
+        successful decode must be a complete, valid record (one of the values
+        the publisher actually wrote) — never a torn mix of two records.
+        """
+        transport = self._new_transport()
+        try:
+            # Seed a first record.
+            transport.send_checkpoint(
+                dst_ranks=[1],
+                step=0,
+                state_dict={"t": torch.tensor([0.0])},
+                timeout=timedelta(seconds=10),
+            )
+
+            stop = threading.Event()
+            errors: List[BaseException] = []
+            seen_statuses: set = set()
+
+            def publisher() -> None:
+                try:
+                    i = 0
+                    while not stop.is_set():
+                        i += 1
+                        # Alternate between a READY snapshot and DISALLOWED so
+                        # the payload contents (and length) change every write.
+                        if i % 2 == 1:
+                            snap = transport._build_snapshot(
+                                *_prepare_state_dict(
+                                    {"t": torch.arange(i % 7 + 1, dtype=torch.float32)},
+                                    i,
+                                    torch.device("cpu"),
+                                ),
+                                step=i,
+                            )
+                            transport._update_control_record(i, "READY", snap)
+                        else:
+                            transport._update_control_record(i, "DISALLOWED", None)
+                except BaseException as exc:  # pragma: no cover - guard
+                    errors.append(exc)
+
+            t = threading.Thread(target=publisher, daemon=True)
+            t.start()
+            try:
+                # Decode many times concurrently with the publisher.
+                deadline = time.monotonic() + 1.5
+                decodes = 0
+                while time.monotonic() < deadline:
+                    rec = self._decode(transport._control_tensor)
+                    if rec is not None:
+                        # A successfully decoded record must be internally
+                        # consistent — these asserts would blow up on torn
+                        # bytes (bad pickle / wrong type).
+                        self.assertEqual(rec.version, _PROTOCOL_VERSION)
+                        self.assertIn(rec.status, ("READY", "DISALLOWED"))
+                        seen_statuses.add(rec.status)
+                        decodes += 1
+            finally:
+                stop.set()
+                t.join(timeout=5)
+
+            if errors:
+                raise errors[0]
+            self.assertGreater(decodes, 0, "reader never decoded a record")
+        finally:
+            transport.shutdown()

@@ -29,6 +29,7 @@ import pickle
 import socket
 import struct
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Callable, Dict, Generic, List, Optional, TypeVar, Union
@@ -131,6 +132,11 @@ class _SnapshotGeneration:
     manifest_mem: object  # torchcomms RdmaMemory or None in tests
     tensor_snapshots: List[torch.Tensor]
     tensor_mems: List[object]  # list[RdmaMemory] or list[None]
+    # CUDA event recorded on the copy stream after the snapshot's D2H/clone
+    # work was enqueued. ``send_checkpoint`` must wait on it before publishing
+    # the control record as READY so receivers never RDMA-read partially
+    # produced bytes. ``None`` on the CPU path (no async work to fence).
+    cuda_event: object = None
 
 
 @dataclass
@@ -214,6 +220,15 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
     def _init_rdma(self) -> None:
         from torchcomms._transport import (  # type: ignore[import-not-found]
             RdmaMemory,
+        )
+
+        # Dedicated copy stream for the snapshot's GPU clone / D2H spill so
+        # the staging is stream-ordered against a stream we control and can
+        # fence with an event before publishing READY (mirrors
+        # ``HTTPTransport``). ``None`` on the CPU path, where copies are
+        # synchronous and need no fence.
+        self._copy_stream: Optional[object] = (
+            torch.cuda.Stream() if self._device.type == "cuda" else None
         )
 
         # Long-lived control buffer; one allocation per transport.
@@ -356,6 +371,12 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         # are still pulling from the previous snapshot.
         self._previous_snapshot = self._current_snapshot
         self._current_snapshot = snapshot
+
+        # B1: the snapshot's GPU clone / D2H spill is stream-ordered and may
+        # still be in flight. Wait on the recorded copy-stream event before we
+        # flip the control record to READY so a receiver can never RDMA-read
+        # partially produced bytes. No READY write may precede this wait.
+        self._wait_snapshot_ready(snapshot)
 
         self._update_control_record(step, "READY", snapshot)
         self._allow_checkpoint(step)
@@ -501,6 +522,18 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             self._disallowed = False
             self._checkpoint_lock.w_release()
 
+    def _wait_snapshot_ready(self, snapshot: _SnapshotGeneration) -> None:
+        """Block until the snapshot's CUDA copy work has fully completed.
+
+        Synchronizes on the event recorded over the copy stream in
+        ``_build_snapshot``. This is the B1 invariant: the caller must invoke
+        this before publishing a READY control record so receivers never see
+        partially produced bytes. A no-op on the CPU path (no event).
+        """
+        event = snapshot.cuda_event
+        if event is not None:
+            event.synchronize()
+
     def _build_snapshot(
         self,
         sd_meta: _StateDictMeta,
@@ -519,25 +552,56 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
 
         self._generation += 1
 
+        # On CUDA, run all clones / D2H spills on the dedicated copy stream so
+        # the work is stream-ordered against a stream we own. We make the copy
+        # stream wait on the current (producer) stream first, so it observes
+        # the latest writes to the source tensors, then record an event after
+        # enqueuing the copies. ``send_checkpoint`` waits on that event before
+        # publishing READY (see B1 in the blockers plan). On CPU there is no
+        # async work and ``_copy_stream`` is ``None``.
+        is_cuda = self._device.type == "cuda"
+        copy_stream = self._copy_stream if is_cuda else None
+        if copy_stream is not None:
+            copy_stream.wait_stream(torch.cuda.current_stream())
+        stream_ctx = (
+            torch.cuda.stream(copy_stream) if copy_stream is not None else nullcontext()
+        )
+
         cloned: List[torch.Tensor] = []
         tensor_mems: List[object] = []
         gpu_snapshot_bytes = 0
         gpu_budget_exceeded = False
-        for t in tensors:
-            if t.device.type == "cuda":
-                t_bytes = t.untyped_storage().nbytes()
-                if (
-                    gpu_budget_exceeded
-                    or gpu_snapshot_bytes + t_bytes > self._max_gpu_snapshot_bytes
-                ):
-                    gpu_budget_exceeded = True
-                    cloned.append(_spill_to_pinned_cpu(t))
+        with stream_ctx:
+            for t in tensors:
+                if t.device.type == "cuda":
+                    t_bytes = t.untyped_storage().nbytes()
+                    if (
+                        gpu_budget_exceeded
+                        or gpu_snapshot_bytes + t_bytes
+                        > self._max_gpu_snapshot_bytes
+                    ):
+                        gpu_budget_exceeded = True
+                        # Only thread the copy stream through on the real CUDA
+                        # path; on the CPU device path ``copy_stream`` is None
+                        # and the spill stays synchronous (single-arg call).
+                        if copy_stream is not None:
+                            cloned.append(_spill_to_pinned_cpu(t, copy_stream))
+                        else:
+                            cloned.append(_spill_to_pinned_cpu(t))
+                    else:
+                        cloned.append(t.clone())
+                        gpu_snapshot_bytes += t_bytes
                 else:
-                    cloned.append(t.clone())
-                    gpu_snapshot_bytes += t_bytes
-            else:
-                cloned.append(t.clone().contiguous())
-            tensor_mems.append(RdmaMemory(cloned[-1], cache_reg=False))
+                    cloned.append(t.clone().contiguous())
+                tensor_mems.append(RdmaMemory(cloned[-1], cache_reg=False))
+
+        # Record the fence event on the copy stream after all snapshot copies
+        # have been enqueued. The publishing path must wait on it before any
+        # READY control-record write becomes visible to receivers.
+        cuda_event: object = None
+        if is_cuda:
+            cuda_event = torch.cuda.Event()
+            cuda_event.record(copy_stream)
 
         # Assemble the manifest with per-tensor RemoteBuffer handles.
         leaves: List[object] = []
@@ -583,6 +647,7 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             manifest_mem=manifest_mem,
             tensor_snapshots=cloned,
             tensor_mems=tensor_mems,
+            cuda_event=cuda_event,
         )
 
     def _update_control_record(
@@ -615,10 +680,20 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
                 f"{_CONTROL_BUFFER_NBYTES} byte buffer"
             )
 
-        # Layout: <uint64 length><payload bytes><zero padding>
+        # Layout: <uint64 length><payload bytes><zero padding>.
+        #
+        # B6 — atomic publication. The length word is the commit point: a
+        # reader treats length==0 as "no record" and only decodes the payload
+        # once a non-zero length is observed. We therefore (1) clear the length
+        # to 0 so a reader racing mid-write never sees a stale length over a
+        # half-written payload, (2) write the full payload, and (3) write the
+        # real length LAST. Because the length is a single aligned 8-byte word,
+        # a reader observes either the old (zeroed) or the new length, never a
+        # torn value, so it decodes either nothing or the complete new record.
         view = self._control_tensor.numpy()
-        struct.pack_into("<Q", view, 0, len(payload))
+        struct.pack_into("<Q", view, 0, 0)
         view[8 : 8 + len(payload)] = bytearray(payload)
+        struct.pack_into("<Q", view, 0, len(payload))
 
     def _read_control_record(
         self,
@@ -851,17 +926,26 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
 # --- Snapshot helpers ---------------------------------------------------------
 
 
-def _spill_to_pinned_cpu(t: torch.Tensor) -> torch.Tensor:
+def _spill_to_pinned_cpu(
+    t: torch.Tensor, copy_stream: Optional[object] = None
+) -> torch.Tensor:
     """Copy ``t``'s raw storage into a freshly allocated pinned CPU buffer.
 
     Used by the sender when a GPU tensor would push the snapshot footprint
     past ``max_gpu_snapshot_bytes``. The returned 1-D ``uint8`` tensor owns
     its storage so it can be registered with the RDMA NIC and read by
     receivers without holding a reference to the live GPU tensor.
+
+    When ``copy_stream`` is provided (the CUDA path), the D2H copy is issued
+    asynchronously (``non_blocking=True``) on the caller's already-active copy
+    stream; completion is fenced by the event recorded in ``_build_snapshot``,
+    so the snapshot is only published READY after the copy has finished. With
+    no copy stream (the CPU path) the copy is synchronous and complete on
+    return.
     """
     nbytes = t.untyped_storage().nbytes()
     cpu = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-    cpu.copy_(t.view(torch.uint8), non_blocking=False)
+    cpu.copy_(t.view(torch.uint8), non_blocking=copy_stream is not None)
     return cpu
 
 
