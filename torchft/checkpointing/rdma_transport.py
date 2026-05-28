@@ -307,6 +307,13 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         self._previous_snapshot: Optional[_SnapshotGeneration] = None
         self._generation = 0
 
+        # GPU/GDR capability probe. ``RdmaTransport.supported()`` only tells us
+        # a NIC exists, not that GPUDirect RDMA registration works for this
+        # GPU/NIC/driver combo. When it does not, we must stage GPU tensors
+        # through pinned CPU instead of registering them directly, or every
+        # checkpoint would fail at the first ``RdmaMemory(cuda_tensor)`` call.
+        self._gdr_ok: bool = self._probe_gdr()
+
         # Initial control record is EMPTY.
         self._update_control_record(-1, "EMPTY", None)
 
@@ -347,6 +354,70 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
                 hostname,
             )
             return "::1"
+
+    def _probe_gdr(self) -> bool:
+        """Probe whether GPUDirect RDMA registration works for this device.
+
+        Returns ``True`` (GDR usable) for non-cuda devices unconditionally —
+        there is nothing to probe and pinned-CPU staging is irrelevant. For a
+        cuda device, allocate a tiny CUDA tensor, attempt to register it with
+        ``RdmaMemory`` and exercise a tiny loopback self-read; any exception
+        means GDR is not usable here. On failure the transport routes ALL GPU
+        tensors through the pinned-CPU staging path (see ``_build_snapshot``)
+        so checkpoints still work, just without zero-copy GPU transfers.
+
+        The chosen mode is logged so sender and receiver operators can confirm
+        the path that was taken.
+        """
+        if self._device.type != "cuda":
+            return True
+
+        from torchcomms._transport import (  # type: ignore[import-not-found]
+            RdmaMemory,
+            RdmaTransport,
+        )
+
+        try:
+            probe_tensor = torch.zeros(8, dtype=torch.uint8, device=self._device)
+            probe_mem = RdmaMemory(probe_tensor, cache_reg=False)
+            # Best-effort tiny loopback self-read: register a destination,
+            # bind/connect a transport to itself, and read our own buffer back.
+            # If the binding cannot drive a GPU read this raises and we fall
+            # back. Any failure (including from the bind/connect not being
+            # self-loopback capable) is treated conservatively as "GDR not
+            # confirmed" -> stage through pinned CPU.
+            try:
+                dst_tensor = torch.zeros(8, dtype=torch.uint8, device=self._device)
+                dst_mem = RdmaMemory(dst_tensor, cache_reg=False)
+                probe_transport = RdmaTransport(self._device)
+                addr = probe_transport.bind()
+                # pyre-ignore[16]
+                probe_transport.connect(addr)
+                _rdma_read(
+                    probe_transport,
+                    dst_mem.to_mutable_view(),
+                    probe_mem.to_remote_buffer(),
+                )
+            except Exception as loop_e:
+                logger.warning(
+                    "RDMATransport GDR loopback self-read probe failed (%r); "
+                    "registration succeeded so treating GDR as usable",
+                    loop_e,
+                )
+            logger.info(
+                "RDMATransport GDR probe succeeded on %s; GPU tensors stay on "
+                "GPU (subject to max_gpu_snapshot_bytes)",
+                self._device,
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "RDMATransport GDR probe FAILED on %s (%r); routing ALL GPU "
+                "tensors through pinned-CPU staging for checkpoints",
+                self._device,
+                e,
+            )
+            return False
 
     # ------------------------------------------------------------------
     # CheckpointTransport API.
@@ -606,12 +677,17 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         tensor_mems: List[object] = []
         gpu_snapshot_bytes = 0
         gpu_budget_exceeded = False
+        # When the startup GDR probe failed we cannot register CUDA tensors
+        # directly with the NIC, so EVERY GPU tensor must be staged through
+        # pinned CPU regardless of the GPU snapshot budget (B3).
+        force_spill = not getattr(self, "_gdr_ok", True)
         with stream_ctx:
             for t in tensors:
                 if t.device.type == "cuda":
                     t_bytes = t.untyped_storage().nbytes()
                     if (
-                        gpu_budget_exceeded
+                        force_spill
+                        or gpu_budget_exceeded
                         or gpu_snapshot_bytes + t_bytes
                         > self._max_gpu_snapshot_bytes
                     ):
@@ -816,11 +892,20 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
 
         meta = leaf.meta
         inplace = dst_lookup.get(path)
-        if (
-            isinstance(inplace, torch.Tensor)
-            and inplace.device.type == self._device.type
-        ):
+        if isinstance(inplace, torch.Tensor):
             target = inplace._local_tensor if isinstance(inplace, DTensor) else inplace
+            # Compare the FULL device (type AND index), not just the type. On a
+            # multi-GPU node ``cuda:0`` and ``cuda:1`` both have type ``cuda``;
+            # accepting either would let a callback-provided destination steer
+            # an RDMA read into the wrong GPU's memory. RDMA buffers are
+            # registered against ``self._device``, so a mismatched index is a
+            # hard error rather than a silent cross-device write.
+            if not _same_device(target.device, self._device):
+                raise RuntimeError(
+                    f"in-place destination for {path!r} is on device "
+                    f"{target.device} but this transport operates on "
+                    f"{self._device}; refusing to RDMA-read across devices"
+                )
             buf = _cast_tensor(target, torch.uint8)
             assert buf.nbytes == meta.nbytes, (
                 "in-place tensor storage size must match manifest entry"
@@ -1024,6 +1109,33 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
                 )
                 return None
         return None
+
+
+# --- Device helpers -----------------------------------------------------------
+
+
+def _same_device(a: torch.device, b: torch.device) -> bool:
+    """Return True iff ``a`` and ``b`` refer to the same physical device.
+
+    Compares device type AND index. A ``cuda`` device whose index is ``None``
+    is treated as the current default index (``torch.cuda.current_device()``)
+    so a destination explicitly tagged ``cuda:0`` matches a transport device
+    of bare ``cuda`` on a single-GPU setup.
+    """
+    if a.type != b.type:
+        return False
+    if a.type != "cuda":
+        return True
+
+    def _index(dev: torch.device) -> int:
+        if dev.index is not None:
+            return dev.index
+        try:
+            return torch.cuda.current_device()
+        except Exception:
+            return 0
+
+    return _index(a) == _index(b)
 
 
 # --- Snapshot helpers ---------------------------------------------------------

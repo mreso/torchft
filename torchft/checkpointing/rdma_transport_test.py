@@ -112,7 +112,19 @@ class _MockRdmaMemory:
         weakref.WeakValueDictionary()
     )
 
+    # When True, constructing an ``RdmaMemory`` from a CUDA-backed tensor
+    # raises, mirroring a node where GPUDirect RDMA registration is
+    # unavailable (IB NIC present, GDR not usable). Safe default: do not
+    # raise, so every existing test is unaffected. Tests flip this to drive
+    # the B3 GDR-probe-failure fallback path.
+    raise_on_cuda: bool = False
+
     def __init__(self, tensor: torch.Tensor, cache_reg: bool = False) -> None:
+        if _MockRdmaMemory.raise_on_cuda and getattr(tensor, "device", None) is not None:
+            if tensor.device.type == "cuda":
+                raise RuntimeError(
+                    "mock: GPUDirect RDMA registration unavailable for CUDA tensor"
+                )
         self.tensor = tensor
         self.cache_reg = cache_reg
         with _MockRdmaMemory._addr_lock:
@@ -141,6 +153,7 @@ class _MockRdmaMemory:
     def reset_registry(cls) -> None:
         with cls._addr_lock:
             cls._registry.clear()
+        cls.raise_on_cuda = False
 
 
 @dataclass
@@ -2966,5 +2979,290 @@ class TestRDMAControlRecordAtomicity(_RDMAMockBase):
             if errors:
                 raise errors[0]
             self.assertGreater(decodes, 0, "reader never decoded a record")
+        finally:
+            transport.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# B3: GPU/GDR capability probe + staged pinned-CPU fallback.
+# ---------------------------------------------------------------------------
+
+
+def _fake_cuda_zeros(real_zeros: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+    """Return a ``torch.zeros`` replacement that fakes CUDA allocations.
+
+    On this CPU-only CI box ``torch.zeros(..., device="cuda")`` and
+    ``pin_memory=True`` both fail. This wrapper strips ``pin_memory`` and,
+    for a ``cuda`` device request, returns a real CPU tensor whose ``.device``
+    is overridden to report cuda (via ``_FakeCudaTensor``). That lets us drive
+    the GDR probe and control-buffer allocation on a "cuda" transport without
+    real hardware.
+    """
+
+    def wrapper(*args: object, **kwargs: object) -> torch.Tensor:
+        device = kwargs.pop("device", None)
+        kwargs.pop("pin_memory", None)
+        if device is not None and torch.device(device).type == "cuda":
+            # Size is the first positional arg in the call sites we patch.
+            nbytes = int(args[0]) if args else int(kwargs.get("size", 0))
+            return _FakeCudaTensor(nbytes)  # type: ignore[return-value]
+        return real_zeros(*args, **kwargs)
+
+    return wrapper
+
+
+class TestRDMAGdrProbe(_RDMAMockBase):
+    """B3: startup GDR probe selects GPU-direct vs pinned-CPU staging."""
+
+    def _new_cuda_transport(
+        self,
+        max_gpu_snapshot_bytes: int = 4 << 30,
+    ) -> RDMATransport:
+        """Construct an RDMATransport on a (faked) cuda device.
+
+        Patches ``torch.zeros`` / ``torch.empty`` (strip ``pin_memory`` and fake
+        the cuda allocations for the probe + control buffer) and ``torch.cuda``
+        (a ``_FakeCudaModule`` providing the copy-stream / event machinery added
+        by B1) so both construction and the post-construction ``_build_snapshot``
+        calls run on a CPU-only host. The patches stay active until
+        ``_teardown_patches`` (called from each test's ``finally``).
+        """
+        from torchft.checkpointing import rdma_transport as mod
+
+        real_zeros = torch.zeros
+        real_empty = torch.empty
+
+        def empty_no_pin(*args: object, **kwargs: object) -> torch.Tensor:
+            kwargs.pop("pin_memory", None)
+            return real_empty(*args, **kwargs)
+
+        self._patches = [
+            patch.object(mod.torch, "cuda", _FakeCudaModule()),
+            patch.object(
+                mod.torch, "zeros", side_effect=_fake_cuda_zeros(real_zeros)
+            ),
+            patch.object(mod.torch, "empty", side_effect=empty_no_pin),
+        ]
+        for p in self._patches:
+            p.start()
+        try:
+            return RDMATransport(
+                device=torch.device("cuda:0"),
+                timeout=timedelta(seconds=10),
+                max_gpu_snapshot_bytes=max_gpu_snapshot_bytes,
+            )
+        except Exception:
+            self._teardown_patches()
+            raise
+
+    def _teardown_patches(self) -> None:
+        for p in getattr(self, "_patches", []):
+            p.stop()
+        self._patches = []
+
+    def test_probe_success_keeps_gpu_tensors_on_gpu(self) -> None:
+        """When RdmaMemory accepts CUDA tensors, the probe passes (gdr_ok)."""
+        _MockRdmaMemory.raise_on_cuda = False
+        transport = self._new_cuda_transport(max_gpu_snapshot_bytes=10_000)
+        try:
+            self.assertTrue(transport._gdr_ok)
+
+            tensors = [_FakeCudaTensor(600), _FakeCudaTensor(600)]
+            sd_meta = _make_cuda_only_state_dict_meta([600, 600])
+
+            from torchft.checkpointing import rdma_transport as mod
+
+            with patch.object(mod, "_spill_to_pinned_cpu") as spill_mock:
+                snap = transport._build_snapshot(sd_meta, tensors, step=1)
+
+            # GDR ok + within budget -> nothing spilled.
+            spill_mock.assert_not_called()
+            self.assertEqual(len(snap.tensor_snapshots), 2)
+        finally:
+            transport.shutdown()
+            self._teardown_patches()
+
+    def test_probe_failure_routes_all_gpu_tensors_through_pinned_cpu(self) -> None:
+        """Probe failure forces EVERY GPU tensor through the spill path.
+
+        Even with a generous ``max_gpu_snapshot_bytes`` that would normally
+        keep all tensors on GPU, a failed GDR probe must stage every GPU
+        tensor through pinned CPU so checkpoints still succeed without GDR.
+        """
+        _MockRdmaMemory.raise_on_cuda = True
+        # Huge budget: without the probe-failure override nothing would spill.
+        transport = self._new_cuda_transport(max_gpu_snapshot_bytes=1 << 40)
+        try:
+            self.assertFalse(transport._gdr_ok)
+
+            tensors = [_FakeCudaTensor(128) for _ in range(4)]
+            sd_meta = _make_cuda_only_state_dict_meta([128, 128, 128, 128])
+
+            # ``raise_on_cuda`` only affects CUDA-backed tensors; the spilled
+            # pinned-CPU buffers and manifest are CPU so RdmaMemory accepts
+            # them. Wrap the real spill to count how many GPU tensors spilled.
+            from torchft.checkpointing import rdma_transport as mod
+
+            real_spill = mod._spill_to_pinned_cpu
+
+            def counting_spill(
+                t: object, copy_stream: object = None
+            ) -> torch.Tensor:
+                nbytes = t.untyped_storage().nbytes()
+                cpu = torch.empty(nbytes, dtype=torch.uint8)  # no pin on CI
+                cpu.copy_(t.view(torch.uint8), non_blocking=False)
+                return cpu
+
+            with patch.object(
+                mod, "_spill_to_pinned_cpu", side_effect=counting_spill
+            ) as spill_mock:
+                snap = transport._build_snapshot(sd_meta, tensors, step=1)
+
+            # All 4 GPU tensors were staged through pinned CPU.
+            self.assertEqual(spill_mock.call_count, 4)
+            self.assertEqual(len(snap.tensor_snapshots), 4)
+            for ts in snap.tensor_snapshots:
+                self.assertEqual(ts.dtype, torch.uint8)
+                self.assertEqual(ts.device.type, "cpu")
+            del real_spill
+        finally:
+            transport.shutdown()
+            self._teardown_patches()
+
+    def test_cpu_device_probe_is_noop(self) -> None:
+        """On a CPU device the probe never runs and gdr_ok stays True."""
+        # Even with raise_on_cuda set, a CPU transport must construct fine and
+        # report gdr_ok=True (the probe short-circuits for non-cuda devices).
+        _MockRdmaMemory.raise_on_cuda = True
+        transport = RDMATransport(
+            device=torch.device("cpu"), timeout=timedelta(seconds=10)
+        )
+        try:
+            self.assertTrue(transport._gdr_ok)
+        finally:
+            transport.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# B5b: in-place receive must check the FULL device (type AND index).
+# ---------------------------------------------------------------------------
+
+
+def _fake_device_tensor(numel: int, device: torch.device) -> torch.Tensor:
+    """Return a real ``torch.Tensor`` whose ``.device`` reports ``device``.
+
+    Backed by CPU storage so it works on CI, but ``.device`` is overridden via
+    a lightweight subclass to simulate an in-place destination living on a
+    specific cuda index without real GPUs. Note ``type(t) is torch.Tensor`` is
+    False for this subclass, so ``_cast_tensor`` (which only accepts standard
+    tensors) rejects it — we use that as the "device check passed" signal in
+    the acceptance tests below.
+    """
+
+    class _FakeDeviceTensor(torch.Tensor):
+        @property
+        def device(self) -> torch.device:  # type: ignore[override]
+            return device
+
+    return _FakeDeviceTensor(torch.zeros(numel, dtype=torch.float32))
+
+
+class TestRDMAInPlaceFullDeviceCheck(_RDMAMockBase):
+    """B5b: reject in-place destinations on a different cuda index."""
+
+    def _make_leaf(self, numel: int) -> _RDMATensorLeaf:
+        nbytes = numel * 4
+        meta = _TensorMeta(
+            shape=torch.Size([numel]),
+            dtype=torch.float32,
+            storage_offset=0,
+            stride=(1,),
+            nbytes=nbytes,
+        )
+        # remote_buffer is unused: the cross-device check fires before any read.
+        return _RDMATensorLeaf(
+            meta=meta, remote_buffer=_MockRdmaRemoteBuffer(addr=1, nbytes=nbytes)
+        )
+
+    def test_inplace_wrong_cuda_index_is_rejected(self) -> None:
+        """A destination on cuda:1 is refused when the transport is on cuda:0."""
+        transport = RDMATransport(
+            device=torch.device("cpu"), timeout=timedelta(seconds=10)
+        )
+        try:
+            # Force the transport device to cuda:0 so the device comparison is
+            # meaningful (no allocation happens in this path).
+            transport._device = torch.device("cuda:0")
+
+            leaf = self._make_leaf(4)
+            path = ("w",)
+            wrong = _fake_device_tensor(4, torch.device("cuda:1"))
+            dst_lookup = {path: wrong}
+
+            mock_transport = _MockRdmaTransport(torch.device("cuda:0"))
+            with self.assertRaisesRegex(RuntimeError, "across devices"):
+                transport._read_one_tensor(
+                    mock_transport, path, leaf, dst_lookup
+                )
+        finally:
+            transport.shutdown()
+
+    def test_inplace_matching_cuda_index_is_accepted(self) -> None:
+        """A destination on the same cuda index passes the device check.
+
+        We can't run a real cuda RDMA read on CI, so we prove the device check
+        passed by observing that control flow reached ``_cast_tensor`` — which
+        rejects our non-standard tensor subclass with a distinct assertion —
+        rather than being rejected earlier as cross-device.
+        """
+        transport = RDMATransport(
+            device=torch.device("cpu"), timeout=timedelta(seconds=10)
+        )
+        try:
+            transport._device = torch.device("cuda:0")
+
+            leaf = self._make_leaf(4)
+            path = ("w",)
+            same_index = _fake_device_tensor(4, torch.device("cuda:0"))
+            dst_lookup = {path: same_index}
+
+            mock_transport = _MockRdmaTransport(torch.device("cuda:0"))
+            # Reaching _cast_tensor (which rejects the non-standard subclass)
+            # proves the device check accepted the same-index destination.
+            with self.assertRaisesRegex(
+                AssertionError, "can only cast standard tensors"
+            ):
+                transport._read_one_tensor(
+                    mock_transport, path, leaf, dst_lookup
+                )
+        finally:
+            transport.shutdown()
+
+    def test_inplace_bare_cuda_matches_indexed_destination(self) -> None:
+        """A bare ``cuda`` transport device matches a ``cuda:0`` destination.
+
+        ``_same_device`` resolves a ``None`` index to the current device, so a
+        destination explicitly on ``cuda:0`` is accepted by a transport whose
+        device is bare ``cuda`` (single-GPU default).
+        """
+        transport = RDMATransport(
+            device=torch.device("cpu"), timeout=timedelta(seconds=10)
+        )
+        try:
+            transport._device = torch.device("cuda")  # no index
+
+            leaf = self._make_leaf(4)
+            path = ("w",)
+            dst = _fake_device_tensor(4, torch.device("cuda:0"))
+            dst_lookup = {path: dst}
+
+            mock_transport = _MockRdmaTransport(torch.device("cuda"))
+            with patch("torch.cuda.current_device", return_value=0):
+                with self.assertRaisesRegex(
+                    AssertionError, "can only cast standard tensors"
+                ):
+                    transport._read_one_tensor(
+                        mock_transport, path, leaf, dst_lookup
+                    )
         finally:
             transport.shutdown()
