@@ -29,6 +29,7 @@ import pickle
 import socket
 import struct
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -61,6 +62,20 @@ _DEFAULT_MAX_MANIFEST_BYTES = 64 * 1024 * 1024
 # Handshake protocol frames.
 _HANDSHAKE_READY = b"READY"
 _HANDSHAKE_DONE = b"DONE"
+
+# Absolute safety deadline for a single peer transfer once the reader-lifetime
+# fence has been acquired. This is intentionally *much* larger than the per-step
+# ``timeout`` (which bounds control-plane RPCs, not the bulk RDMA read). The
+# fence is released on DONE / dead-connection detection long before this fires;
+# it exists only as a backstop so a permanently wedged-but-connected peer cannot
+# pin a snapshot generation forever. See BLOCKER B2.
+_DEFAULT_MAX_TRANSFER_SECONDS = 3600.0
+
+# Polling interval used while the handshake handler waits for DONE. Each poll
+# blocks on the socket for at most this long; TCP keepalive failures, EOF, or a
+# DONE frame end the wait immediately. Kept short so liveness (a dropped socket)
+# is detected promptly without busy-waiting.
+_FENCE_POLL_INTERVAL_SECONDS = 1.0
 
 
 def _rdma_available() -> bool:
@@ -180,6 +195,15 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             TCP handshake server. Defaults to the ``TORCHFT_RDMA_HANDSHAKE_HOST``
             env var, then a resolvable hostname, then loopback. In real
             clusters set this (or the env var) to a routable IP/FQDN.
+        max_transfer_seconds: absolute safety deadline (in seconds) for a single
+            peer transfer once the reader-lifetime fence is held. Distinct from
+            ``timeout`` (which bounds per-step control-plane RPCs). The fence is
+            normally released on DONE or on a detected dead connection (TCP
+            keepalive failure / socket error / EOF); this deadline is only a
+            backstop against a wedged-but-still-connected peer. Defaults to a
+            generous value (1 hour) so a healthy but slow transfer over a large
+            checkpoint / slow fabric is never released prematurely. See
+            BLOCKER B2.
     """
 
     def __init__(
@@ -190,6 +214,7 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         max_gpu_snapshot_bytes: int = 4 << 30,
         max_manifest_bytes: int = _DEFAULT_MAX_MANIFEST_BYTES,
         handshake_host: Optional[str] = None,
+        max_transfer_seconds: float = _DEFAULT_MAX_TRANSFER_SECONDS,
     ) -> None:
         self._device = device
         self._timeout = timeout
@@ -197,6 +222,7 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         self._max_gpu_snapshot_bytes = max_gpu_snapshot_bytes
         self._max_manifest_bytes = max_manifest_bytes
         self._handshake_host_override = handshake_host
+        self._max_transfer_seconds = max_transfer_seconds
 
         self._fallback: Optional[CheckpointTransport[T]] = None
         self._rdma: Optional[bool] = None
@@ -264,7 +290,16 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         self._peers: Dict[bytes, _PeerConnection] = {}
         self._peers_lock = threading.Lock()
 
-        self._checkpoint_lock = RWLock(timeout=self._timeout.total_seconds())
+        # The reader fence may legitimately be held for an entire (slow) peer
+        # transfer, so the RWLock timeout must cover the absolute transfer
+        # safety deadline -- NOT the per-step ``timeout``. Bounding it by the
+        # short per-step timeout would make ``disallow_checkpoint()``'s
+        # ``w_acquire`` raise on a healthy-but-slow transfer (BLOCKER B2),
+        # defeating the fence. A small margin is added so the handler's own
+        # backstop fires first and releases cleanly. (See ``_wait_for_done``.)
+        self._checkpoint_lock = RWLock(
+            timeout=self._max_transfer_seconds + _FENCE_POLL_INTERVAL_SECONDS + 5.0
+        )
         self._disallowed = False
         self._step = -1
 
@@ -829,6 +864,10 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             timeout=timeout.total_seconds(),
         )
         try:
+            # Keepalive on the receiver side too: if the sender dies mid
+            # transfer the receiver's blocking reads surface an error instead
+            # of hanging, and the sender's matching fence socket sees the drop.
+            _enable_tcp_keepalive(sock)
             sock.settimeout(timeout.total_seconds())
             _send_frame(sock, recv_bind_addr)
             sender_addr = _recv_frame(sock)
@@ -866,6 +905,14 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             t.start()
 
     def _handle_peer_connection(self, conn: socket.socket) -> None:
+        # CUDA current device is thread-local; this handler runs in a fresh
+        # thread and constructs torchcomms objects bound to ``self._device``.
+        # Pin the device before any of that so a multi-GPU sender binds the
+        # RdmaTransport / RdmaMemory to the right GPU (RISK B5a). CPU is a
+        # no-op.
+        if self._device.type == "cuda":
+            torch.cuda.set_device(self._device)
+
         from torchcomms._transport import (  # type: ignore[import-not-found]
             RdmaTransport as _RdmaTransport,
         )
@@ -874,6 +921,12 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         peer_addr: Optional[bytes] = None
         held_lock = False
         try:
+            # Keepalive turns a dead peer into a socket error / EOF on the
+            # blocking DONE wait below, which is the liveness oracle that
+            # releases the fence (BLOCKER B2). The per-step ``timeout`` only
+            # bounds the small control-plane frames (peer_addr handshake), not
+            # the bulk transfer.
+            _enable_tcp_keepalive(conn)
             conn.settimeout(timeout_s)
             peer_addr = _recv_frame(conn)
 
@@ -899,9 +952,16 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             held_lock = True
             _send_frame(conn, _HANDSHAKE_READY)
 
-            # Block until the receiver finishes (or the socket times out /
-            # drops). Either way, the ``finally`` releases the lock.
-            done = _recv_frame(conn)
+            # Wait for the receiver's DONE. We deliberately do NOT release the
+            # fence on a short idle timeout (a healthy but slow transfer would
+            # be killed mid-read -> use-after-free). Instead we hold the fence
+            # until one of:
+            #   * DONE arrives                  -> released promptly,
+            #   * the connection is detected
+            #     dead (keepalive failure /
+            #     socket error / EOF)           -> liveness release,
+            #   * the absolute safety deadline  -> backstop release.
+            done = self._wait_for_done(conn, peer_addr)
             if done != _HANDSHAKE_DONE:
                 logger.warning(
                     "handshake server: expected DONE frame, got %r", done
@@ -921,6 +981,49 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
                 conn.close()
             except Exception:
                 pass
+
+    def _wait_for_done(
+        self, conn: socket.socket, peer_addr: bytes
+    ) -> Optional[bytes]:
+        """Hold the fence until DONE, a dead connection, or the safety deadline.
+
+        Polls the socket with a short per-read timeout so a *dropped* peer is
+        detected promptly (EOF / connection error -> the fence is released by
+        the caller's ``finally``), while a *slow-but-alive* peer keeps blocking
+        without tripping any idle deadline. The only time-based release is the
+        generous absolute ``max_transfer_seconds`` backstop. Returns the DONE
+        frame on success, otherwise ``None`` (caller treats both
+        dead-connection and deadline as "release the fence").
+        """
+        deadline = time.monotonic() + self._max_transfer_seconds
+        while not self._shutdown_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "handshake server: peer %r exceeded max_transfer_seconds "
+                    "(%.1fs); releasing reader fence as a safety backstop",
+                    peer_addr,
+                    self._max_transfer_seconds,
+                )
+                return None
+            conn.settimeout(min(_FENCE_POLL_INTERVAL_SECONDS, remaining))
+            try:
+                return _recv_frame(conn)
+            except socket.timeout:
+                # Idle but the connection is still up (keepalive would have
+                # raised otherwise): the peer is alive, keep holding the fence.
+                continue
+            except (ConnectionError, OSError) as e:
+                # Dead/dropped connection (incl. keepalive failure or EOF from
+                # _recv_exact). Liveness says release the fence now.
+                logger.warning(
+                    "handshake server: peer %r connection lost before DONE "
+                    "(%r); releasing reader fence",
+                    peer_addr,
+                    e,
+                )
+                return None
+        return None
 
 
 # --- Snapshot helpers ---------------------------------------------------------
@@ -965,6 +1068,48 @@ def _rdma_read(transport: object, mutable_view: object, remote_buffer: object) -
     rc = transport.read(mutable_view, remote_buffer)
     if rc:
         raise RuntimeError(f"RDMA read failed with status {rc}")
+
+
+# --- TCP keepalive ------------------------------------------------------------
+
+
+def _enable_tcp_keepalive(
+    sock: socket.socket,
+    idle_s: int = 5,
+    interval_s: int = 2,
+    count: int = 3,
+) -> None:
+    """Turn on TCP keepalive so a *dead* peer is detected on the fence socket.
+
+    This is the liveness oracle for the reader-lifetime fence (BLOCKER B2): a
+    *slow-but-alive* peer keeps the connection (and therefore the fence) up,
+    while a peer whose host has died / dropped off the network trips keepalive
+    and surfaces a socket error to the blocked ``recv``, releasing the fence.
+
+    ``TCP_KEEPIDLE``/``TCP_KEEPINTVL``/``TCP_KEEPCNT`` (and the macOS
+    ``TCP_KEEPALIVE``) are best-effort: any that the platform lacks are
+    skipped. ``SO_KEEPALIVE`` alone still works, just with OS-default timing.
+    """
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        logger.warning("could not enable SO_KEEPALIVE on handshake socket")
+        return
+    # Per-connection tuning where the platform exposes it. Linux uses
+    # TCP_KEEPIDLE/INTVL/CNT; macOS uses TCP_KEEPALIVE for the idle time.
+    for opt_name, value in (
+        ("TCP_KEEPIDLE", idle_s),
+        ("TCP_KEEPALIVE", idle_s),  # macOS spelling of the idle time
+        ("TCP_KEEPINTVL", interval_s),
+        ("TCP_KEEPCNT", count),
+    ):
+        opt = getattr(socket, opt_name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+        except OSError:
+            logger.debug("could not set %s on handshake socket", opt_name)
 
 
 # --- TCP framing helpers ------------------------------------------------------

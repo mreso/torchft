@@ -160,6 +160,11 @@ class _MockRdmaTransport:
     instances: List["_MockRdmaTransport"] = []
     instances_lock: threading.Lock = threading.Lock()
 
+    # Injectable per-read delay (seconds). Default 0 keeps existing tests
+    # unaffected; tests that need a slow transfer set this to simulate a read
+    # that outlasts the per-step timeout (BLOCKER B2).
+    read_delay_s: float = 0.0
+
     def __init__(self, device: torch.device) -> None:
         self.device = device
         self.record = _MockRdmaTransportRecord()
@@ -199,6 +204,12 @@ class _MockRdmaTransport:
         assert isinstance(remote_buffer, _MockRdmaRemoteBuffer), (
             f"unexpected remote_buffer type: {type(remote_buffer)}"
         )
+        # Simulate a slow fabric / large transfer if a delay was injected. The
+        # registry lookup happens AFTER the delay so a test can assert the
+        # source buffer is still registered for the whole read.
+        delay = getattr(self, "read_delay_s", 0.0)
+        if delay:
+            time.sleep(delay)
         src_mem = _MockRdmaMemory._registry.get(remote_buffer.addr)
         assert src_mem is not None, (
             f"mock read against unregistered addr {remote_buffer.addr}"
@@ -233,6 +244,8 @@ class _MockRdmaTransport:
             cls.instances.clear()
         with cls._id_lock:
             cls._next_id = 0
+        # Clear any injected per-read delay so it does not leak across tests.
+        cls.read_delay_s = 0.0
 
 
 def _install_torchcomms_mock() -> object:
@@ -948,11 +961,16 @@ class _RDMAMockBase(TestCase):
         self,
         timeout: timedelta = timedelta(seconds=10),
         state_dict_fn: Optional[Callable[[], object]] = None,
+        max_transfer_seconds: Optional[float] = None,
     ) -> RDMATransport:
+        kwargs = {}
+        if max_transfer_seconds is not None:
+            kwargs["max_transfer_seconds"] = max_transfer_seconds
         return RDMATransport(
             device=torch.device("cpu"),
             timeout=timeout,
             state_dict=state_dict_fn,
+            **kwargs,
         )
 
     def _open_handshake(
@@ -1358,9 +1376,26 @@ class TestRDMAPhase2Locking(_RDMAMockBase):
             transport.shutdown()
 
     def test_hung_receiver_times_out_after_ready(self) -> None:
-        """A receiver that gets to READY but never sends DONE is timed out and the lock released."""
-        # Short timeout so the test doesn't take forever.
-        transport = self._new_transport(timeout=timedelta(milliseconds=400))
+        """A hung-but-CONNECTED receiver holds the fence until the safety deadline.
+
+        Updated for BLOCKER B2: the fence is no longer released on a mere
+        per-step idle timeout (that would free a snapshot mid-read on a
+        healthy-but-slow transfer -> use-after-free). A receiver that reaches
+        READY and then goes silent *while keeping its socket open* is treated
+        as a slow-but-alive peer: the fence stays held until the absolute
+        ``max_transfer_seconds`` backstop fires, well past the short per-step
+        ``timeout``. We use a small ``max_transfer_seconds`` here so the test
+        can observe (a) the fence surviving the per-step timeout and (b) the
+        backstop eventually releasing it.
+
+        (Liveness for a *dropped* socket is covered separately by
+        ``TestRDMAFenceLiveness.test_dropped_receiver_releases_fence_promptly``.)
+        """
+        per_step_timeout = timedelta(milliseconds=200)
+        backstop_s = 2.0
+        transport = self._new_transport(
+            timeout=per_step_timeout, max_transfer_seconds=backstop_s
+        )
         try:
             transport.send_checkpoint(
                 dst_ranks=[1],
@@ -1375,13 +1410,24 @@ class TestRDMAPhase2Locking(_RDMAMockBase):
                 self._wait_for(
                     lambda: transport._checkpoint_lock.w_locked(), timeout=2
                 )
-                # Handler is blocked in _recv_frame waiting for DONE; it should
-                # time out per the transport timeout and release the r_lock.
+
+                # The connection is alive (we keep the socket open) but idle.
+                # The handler must NOT release the fence merely because the
+                # per-step timeout elapsed -- wait well past it and confirm the
+                # fence is still held.
+                time.sleep(per_step_timeout.total_seconds() * 4)
+                self.assertTrue(
+                    transport._checkpoint_lock.w_locked(),
+                    "fence released on idle per-step timeout (B2 regression)",
+                )
+                self.assertEqual(len(transport._peers), 1)
+
+                # Eventually the absolute safety backstop fires and releases
+                # the fence even though the peer never sent DONE.
                 self._wait_for(
                     lambda: not transport._checkpoint_lock.w_locked(),
-                    timeout=5,
+                    timeout=backstop_s + 3,
                 )
-                # Peer entry should be cleaned up after timeout.
                 self._wait_for(
                     lambda: len(transport._peers) == 0, timeout=2
                 )
@@ -1391,8 +1437,8 @@ class TestRDMAPhase2Locking(_RDMAMockBase):
                 except Exception:
                     pass
 
-            # disallow_checkpoint should now succeed quickly because the
-            # reader released its lock on timeout.
+            # disallow_checkpoint should now succeed because the backstop
+            # released the reader lock.
             disallow_done = threading.Event()
 
             def disallow() -> None:
@@ -2261,6 +2307,276 @@ class TestRDMAGpuSnapshotSpill(_RDMAMockBase):
             self.assertEqual(len(snap.tensor_snapshots), 3)
         finally:
             transport.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# BLOCKER B2: lifetime fence tied to RDMA liveness/completion, not idle timeout.
+# ---------------------------------------------------------------------------
+
+
+class TestRDMAFenceLiveness(_RDMAMockBase):
+    """The reader-lifetime fence survives a slow transfer and releases on drop.
+
+    These tests pin down the BLOCKER B2 contract: a healthy-but-slow RDMA read
+    (longer than the per-step ``timeout``) must NOT release the fence, while a
+    receiver that drops its socket must release it promptly via TCP liveness.
+    """
+
+    def test_slow_read_holds_fence_until_done(self) -> None:
+        """A read slower than the per-step ``timeout`` keeps the fence held.
+
+        The receiver runs a real ``recv_checkpoint`` whose RDMA reads are
+        injected with a delay well beyond the sender's per-step ``timeout``.
+        While that read is in flight a concurrent ``disallow_checkpoint()`` must
+        block (the fence is held), and the snapshot's ``RdmaMemory`` must stay
+        registered for the whole read. Once the receiver sends ``DONE`` the
+        fence releases and ``disallow`` returns.
+        """
+        # Per-step timeout is short; the read deliberately outlasts it. The
+        # safety backstop is large so it never fires during the test.
+        per_step = timedelta(milliseconds=300)
+        read_delay = 1.2  # > 4x the per-step timeout
+        sender = self._new_transport(
+            timeout=per_step, max_transfer_seconds=120.0
+        )
+        try:
+            payload = {"w": torch.arange(8, dtype=torch.float32)}
+            sender.send_checkpoint(
+                dst_ranks=[1],
+                step=7,
+                state_dict=payload,
+                timeout=timedelta(seconds=10),
+            )
+            metadata = sender.metadata()
+
+            snap = sender._current_snapshot
+            self.assertIsNotNone(snap)
+            tensor_addr = snap.tensor_mems[0].to_remote_buffer().addr
+            self.assertIn(tensor_addr, _MockRdmaMemory._registry)
+
+            # Inject the slow read for every mock transport (sender + receiver
+            # per-peer instances).
+            _MockRdmaTransport.read_delay_s = read_delay
+
+            recv_result: Dict[str, object] = {}
+            recv_error: List[BaseException] = []
+            recv_done = threading.Event()
+
+            receiver = self._new_transport(
+                timeout=per_step, max_transfer_seconds=120.0
+            )
+            try:
+                def do_recv() -> None:
+                    try:
+                        recv_result["v"] = receiver.recv_checkpoint(
+                            src_rank=0,
+                            metadata=metadata,
+                            step=7,
+                            timeout=timedelta(seconds=10),
+                        )
+                    except BaseException as exc:  # pragma: no cover - guard
+                        recv_error.append(exc)
+                    finally:
+                        recv_done.set()
+
+                rt = threading.Thread(target=do_recv, daemon=True)
+                rt.start()
+
+                # Wait until the sender's fence is held (handshake reached
+                # READY and the handler took the reader lock).
+                self._wait_for(
+                    lambda: sender._checkpoint_lock.w_locked(), timeout=5
+                )
+
+                disallow_done = threading.Event()
+
+                def disallow() -> None:
+                    sender.disallow_checkpoint()
+                    disallow_done.set()
+
+                d = threading.Thread(target=disallow, daemon=True)
+                d.start()
+
+                # Across a span longer than the per-step timeout (but shorter
+                # than the read delay), the fence must stay held and the
+                # snapshot buffer must stay registered: the slow read is still
+                # in flight, so disallow cannot proceed.
+                deadline = time.monotonic() + (
+                    per_step.total_seconds() * 2
+                )
+                while time.monotonic() < deadline:
+                    self.assertFalse(
+                        disallow_done.is_set(),
+                        "disallow returned mid-read (B2: fence released on "
+                        "idle timeout)",
+                    )
+                    self.assertIn(
+                        tensor_addr,
+                        _MockRdmaMemory._registry,
+                        "snapshot RdmaMemory deregistered during in-flight read",
+                    )
+                    time.sleep(0.05)
+
+                # The read eventually completes and the receiver sends DONE,
+                # the fence releases, and disallow returns.
+                self.assertTrue(recv_done.wait(timeout=10))
+                if recv_error:
+                    raise recv_error[0]
+                self.assertTrue(disallow_done.wait(timeout=5))
+                d.join(timeout=2)
+                rt.join(timeout=2)
+
+                torch.testing.assert_close(recv_result["v"]["w"], payload["w"])
+                self.assertTrue(sender._disallowed)
+                self.assertEqual(
+                    self._read_control(sender).status, "DISALLOWED"
+                )
+            finally:
+                receiver.shutdown()
+        finally:
+            _MockRdmaTransport.read_delay_s = 0.0
+            sender.shutdown()
+
+    def test_dropped_receiver_releases_fence_promptly(self) -> None:
+        """A receiver that drops its socket without DONE releases the fence.
+
+        This is the liveness half of B2: even though the fence is no longer
+        released on an idle timeout, a *dead* connection (the receiver closes
+        its socket mid-transfer) must still release it promptly so
+        ``disallow_checkpoint()`` can proceed -- far sooner than the generous
+        ``max_transfer_seconds`` backstop.
+        """
+        # Large backstop so a "prompt" release can only come from liveness
+        # (EOF on the dropped socket), not from the safety deadline.
+        transport = self._new_transport(
+            timeout=timedelta(milliseconds=300), max_transfer_seconds=600.0
+        )
+        try:
+            transport.send_checkpoint(
+                dst_ranks=[1],
+                step=1,
+                state_dict={"t": torch.tensor([1.0])},
+                timeout=timedelta(seconds=10),
+            )
+
+            sock = self._open_handshake(transport, b"mock://dropper")
+            # Fence is now held by the handler.
+            self._wait_for(
+                lambda: transport._checkpoint_lock.w_locked(), timeout=2
+            )
+
+            disallow_done = threading.Event()
+
+            def disallow() -> None:
+                transport.disallow_checkpoint()
+                disallow_done.set()
+
+            d = threading.Thread(target=disallow, daemon=True)
+            d.start()
+            # While the receiver is connected and silent, disallow is blocked.
+            self.assertFalse(disallow_done.wait(timeout=0.5))
+
+            # Drop the socket WITHOUT sending DONE. The handler's blocking read
+            # sees EOF -> liveness release, well before the 600s backstop.
+            sock.close()
+
+            self.assertTrue(
+                disallow_done.wait(timeout=5),
+                "dropped receiver did not release the fence promptly",
+            )
+            d.join(timeout=2)
+            self._wait_for(lambda: len(transport._peers) == 0, timeout=2)
+            self.assertEqual(self._read_control(transport).status, "DISALLOWED")
+        finally:
+            transport.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# RISK B5a: handshake handler threads must pin the CUDA device.
+# ---------------------------------------------------------------------------
+
+
+class TestRDMAHandshakeCudaDevice(_RDMAMockBase):
+    """``_handle_peer_connection`` pins the CUDA device before torchcomms use."""
+
+    def test_handshake_handler_sets_cuda_device(self) -> None:
+        """When device.type == cuda the handler calls ``torch.cuda.set_device``.
+
+        CUDA current device is thread-local and the handler runs in a fresh
+        thread, so it must pin ``self._device`` before constructing the
+        per-peer ``RdmaTransport`` (RISK B5a). We patch ``torch.cuda.set_device``
+        (so no real GPU is touched) and drive a single handshake.
+
+        To keep the test CPU-simulatable and deterministic we build a normal
+        CPU transport (so all buffers / snapshots stay on host memory and the
+        ``.numpy()`` control-record path works) and then flip ``_device`` to a
+        fake ``cuda`` device just before driving the handshake. The handler
+        reads ``self._device`` to decide whether to pin, exactly as it would on
+        a real GPU node, while the mock ``RdmaTransport`` happily accepts the
+        cuda device.
+        """
+        recorded: List[object] = []
+        cuda_device = torch.device("cuda:0")
+
+        with patch.object(
+            torch.cuda, "set_device", side_effect=lambda d: recorded.append(d)
+        ):
+            transport = self._new_transport(max_transfer_seconds=120.0)
+            try:
+                transport.send_checkpoint(
+                    dst_ranks=[1],
+                    step=1,
+                    state_dict={"t": torch.tensor([1.0])},
+                    timeout=timedelta(seconds=10),
+                )
+
+                # Now make the handler take the cuda branch. Snapshot/control
+                # buffers were already built on CPU above.
+                transport._device = cuda_device
+
+                sock = self._open_handshake(transport, b"mock://cuda-peer")
+                try:
+                    # The handler thread must have pinned the cuda device
+                    # before constructing the per-peer RdmaTransport.
+                    self._wait_for(lambda: len(recorded) >= 1, timeout=5)
+                    self.assertEqual(recorded[0], cuda_device)
+                    _send_frame(sock, _HANDSHAKE_DONE)
+                finally:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            finally:
+                transport.shutdown()
+
+    def test_cpu_handshake_does_not_set_cuda_device(self) -> None:
+        """The CPU path never calls ``torch.cuda.set_device`` (guarded)."""
+        recorded: List[object] = []
+
+        with patch.object(
+            torch.cuda, "set_device", side_effect=lambda d: recorded.append(d)
+        ):
+            transport = self._new_transport()
+            try:
+                transport.send_checkpoint(
+                    dst_ranks=[1],
+                    step=1,
+                    state_dict={"t": torch.tensor([1.0])},
+                    timeout=timedelta(seconds=10),
+                )
+                sock = self._open_handshake(transport, b"mock://cpu-peer")
+                try:
+                    # Give the handler a moment to run; it must NOT touch CUDA.
+                    time.sleep(0.3)
+                    self.assertEqual(recorded, [])
+                    _send_frame(sock, _HANDSHAKE_DONE)
+                finally:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            finally:
+                transport.shutdown()
 
 
 # ---------------------------------------------------------------------------
