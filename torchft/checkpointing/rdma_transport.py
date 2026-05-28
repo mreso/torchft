@@ -24,6 +24,7 @@ The wire protocol has three levels (see ``docs/rdma_transport_plan_final.md``):
 
 import base64
 import logging
+import os
 import pickle
 import socket
 import struct
@@ -169,6 +170,10 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             snapshots before the sender spills new snapshots to pinned CPU
             memory.
         max_manifest_bytes: hard cap on the size of the per-step manifest.
+        handshake_host: address other hosts should use to reach this sender's
+            TCP handshake server. Defaults to the ``TORCHFT_RDMA_HANDSHAKE_HOST``
+            env var, then a resolvable hostname, then loopback. In real
+            clusters set this (or the env var) to a routable IP/FQDN.
     """
 
     def __init__(
@@ -178,12 +183,14 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         state_dict: Optional[Callable[[], object]] = None,
         max_gpu_snapshot_bytes: int = 4 << 30,
         max_manifest_bytes: int = _DEFAULT_MAX_MANIFEST_BYTES,
+        handshake_host: Optional[str] = None,
     ) -> None:
         self._device = device
         self._timeout = timeout
         self._state_dict_fn = state_dict
         self._max_gpu_snapshot_bytes = max_gpu_snapshot_bytes
         self._max_manifest_bytes = max_manifest_bytes
+        self._handshake_host_override = handshake_host
 
         self._fallback: Optional[CheckpointTransport[T]] = None
         self._rdma: Optional[bool] = None
@@ -226,10 +233,18 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         # over the resulting TCP connection (not advertised globally).
         self._handshake_server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         self._handshake_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Dual-stack so an advertised IPv4 (e.g. a loopback fallback) still
+        # reaches this IPv6 listener via IPv4-mapped addresses.
+        try:
+            self._handshake_server.setsockopt(
+                socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0
+            )
+        except OSError:
+            logger.warning("could not disable IPV6_V6ONLY on handshake server")
         self._handshake_server.bind(("::", 0))
         self._handshake_server.listen(16)
         self._handshake_port = self._handshake_server.getsockname()[1]
-        self._handshake_host = socket.gethostname()
+        self._handshake_host = self._resolve_handshake_host()
 
         self._peers: Dict[bytes, _PeerConnection] = {}
         self._peers_lock = threading.Lock()
@@ -255,6 +270,33 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         self._handshake_thread.start()
 
         self._rdma = True
+
+    def _resolve_handshake_host(self) -> str:
+        """Pick the address peers should use to reach the handshake server.
+
+        Resolution order: explicit constructor arg, then the
+        ``TORCHFT_RDMA_HANDSHAKE_HOST`` env var, then ``gethostname()`` if it is
+        actually resolvable, then IPv6 loopback. ``gethostname()`` is often not
+        resolvable on dev boxes / containers, so we never advertise it blindly.
+        Real multi-host deployments should pass a routable IP/FQDN explicitly.
+        """
+        host = self._handshake_host_override or os.environ.get(
+            "TORCHFT_RDMA_HANDSHAKE_HOST"
+        )
+        if host:
+            return host
+        hostname = socket.gethostname()
+        try:
+            socket.getaddrinfo(hostname, None)
+            return hostname
+        except socket.gaierror:
+            logger.warning(
+                "hostname %r is not resolvable; advertising loopback for the "
+                "RDMA handshake. Set TORCHFT_RDMA_HANDSHAKE_HOST (or the "
+                "handshake_host arg) to a routable address for multi-host use.",
+                hostname,
+            )
+            return "::1"
 
     # ------------------------------------------------------------------
     # CheckpointTransport API.
@@ -588,8 +630,10 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         from torchcomms._transport import RdmaMemory  # type: ignore[import-not-found]
 
         local_mem = RdmaMemory(local, cache_reg=False)
-        # pyre-ignore[16]
-        transport.read(local_mem.to_view(), bootstrap.control_remote_buffer)
+        # RDMA reads write into the local buffer, so they require a *mutable*
+        # view (RdmaMemoryMutableView). Passing the immutable to_view() here
+        # raises TypeError against the real torchcomms binding.
+        _rdma_read(transport, local_mem.to_mutable_view(), bootstrap.control_remote_buffer)
         view = local.numpy()
         (length,) = struct.unpack_from("<Q", view, 0)
         if length == 0:
@@ -614,10 +658,11 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
     ) -> _RDMAManifest:
         from torchcomms._transport import RdmaMemory  # type: ignore[import-not-found]
 
+        if control.manifest_remote_buffer is None:
+            raise RuntimeError("control record is READY but has no manifest buffer")
         local = torch.empty(control.manifest_nbytes, dtype=torch.uint8)
         local_mem = RdmaMemory(local, cache_reg=False)
-        # pyre-ignore[16]
-        transport.read(local_mem.to_view(), control.manifest_remote_buffer)
+        _rdma_read(transport, local_mem.to_mutable_view(), control.manifest_remote_buffer)
         manifest = pickle.loads(bytes(local.numpy()))
         assert isinstance(manifest, _RDMAManifest)
         return manifest
@@ -674,8 +719,7 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             buf = torch.empty(meta.nbytes, dtype=torch.uint8, device=self._device)
 
         local_mem = RdmaMemory(buf, cache_reg=False)
-        # pyre-ignore[16]
-        transport.read(local_mem.to_view(), leaf.remote_buffer)
+        _rdma_read(transport, local_mem.to_mutable_view(), leaf.remote_buffer)
 
         return torch.as_strided(
             buf.view(meta.dtype),
@@ -819,6 +863,24 @@ def _spill_to_pinned_cpu(t: torch.Tensor) -> torch.Tensor:
     cpu = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
     cpu.copy_(t.view(torch.uint8), non_blocking=False)
     return cpu
+
+
+# --- RDMA read helper ---------------------------------------------------------
+
+
+def _rdma_read(transport: object, mutable_view: object, remote_buffer: object) -> None:
+    """Issue a one-sided RDMA read and surface a non-zero status as an error.
+
+    ``mutable_view`` must come from ``RdmaMemory.to_mutable_view()`` — the
+    torchcomms ``read`` binding requires an ``RdmaMemoryMutableView`` because
+    the transfer writes into the local buffer. The C++ binding returns an
+    ``int`` status code; anything non-zero is a failed transfer that would
+    otherwise be silently ignored.
+    """
+    # pyre-ignore[16]
+    rc = transport.read(mutable_view, remote_buffer)
+    if rc:
+        raise RuntimeError(f"RDMA read failed with status {rc}")
 
 
 # --- TCP framing helpers ------------------------------------------------------

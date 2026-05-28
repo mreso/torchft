@@ -60,6 +60,35 @@ class _MockRdmaRemoteBuffer:
     rkey: int = 0
 
 
+class _MockRdmaMemoryView:
+    """Immutable view, mirrors torchcomms ``RdmaMemoryView``.
+
+    Returned by ``RdmaMemory.to_view()`` and accepted by ``write()``. The real
+    binding rejects this type for ``read()`` (reads write into the local
+    buffer), so the mock does too — that is what catches the to_view/
+    to_mutable_view contract bug.
+    """
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self._tensor = tensor
+
+    def size(self) -> int:
+        return self._tensor.numel() * self._tensor.element_size()
+
+
+class _MockRdmaMemoryMutableView:
+    """Mutable view, mirrors torchcomms ``RdmaMemoryMutableView``.
+
+    Returned by ``RdmaMemory.to_mutable_view()`` and required by ``read()``.
+    """
+
+    def __init__(self, tensor: torch.Tensor) -> None:
+        self._tensor = tensor
+
+    def size(self) -> int:
+        return self._tensor.numel() * self._tensor.element_size()
+
+
 # ---------------------------------------------------------------------------
 # Mocks for the torchcomms._transport module so we can drive the RDMA path
 # without RDMA hardware. Memory is faked by an in-process registry mapping
@@ -97,8 +126,11 @@ class _MockRdmaMemory:
             nbytes=self.tensor.numel() * self.tensor.element_size(),
         )
 
-    def to_view(self) -> torch.Tensor:
-        return self.tensor
+    def to_view(self) -> "_MockRdmaMemoryView":
+        return _MockRdmaMemoryView(self.tensor)
+
+    def to_mutable_view(self) -> "_MockRdmaMemoryMutableView":
+        return _MockRdmaMemoryMutableView(self.tensor)
 
     def deregister(self) -> None:
         """Drop this buffer from the global registry so reads against it fail."""
@@ -145,10 +177,25 @@ class _MockRdmaTransport:
         self.record.bind_addrs.append(addr)
         return addr
 
-    def connect(self, peer_addr: bytes) -> None:
+    def connect(self, peer_addr: bytes) -> int:
         self.record.connect_calls.append(peer_addr)
+        self._connected = True
+        return 0
 
-    def read(self, local_view: torch.Tensor, remote_buffer: object) -> None:
+    def connected(self) -> bool:
+        return getattr(self, "_connected", False)
+
+    def read(
+        self, local_view: "_MockRdmaMemoryMutableView", remote_buffer: object
+    ) -> int:
+        # The real torchcomms ``read`` binding requires an
+        # ``RdmaMemoryMutableView``; passing an immutable ``RdmaMemoryView``
+        # (from ``to_view()``) raises TypeError. Model that contract so the
+        # mock catches the bug instead of silently accepting either type.
+        assert isinstance(local_view, _MockRdmaMemoryMutableView), (
+            f"read() requires a mutable view (RdmaMemoryMutableView), got "
+            f"{type(local_view).__name__}; use to_mutable_view()"
+        )
         assert isinstance(remote_buffer, _MockRdmaRemoteBuffer), (
             f"unexpected remote_buffer type: {type(remote_buffer)}"
         )
@@ -158,8 +205,27 @@ class _MockRdmaTransport:
         )
         nbytes = remote_buffer.nbytes
         src_view = src_mem.tensor.view(torch.uint8)[:nbytes]
-        local_view.view(torch.uint8)[:nbytes].copy_(src_view)
+        local_view._tensor.view(torch.uint8)[:nbytes].copy_(src_view)
         self.record.reads.append((remote_buffer.addr, nbytes))
+        return 0
+
+    def write(
+        self, local_view: "_MockRdmaMemoryView", remote_buffer: object
+    ) -> int:
+        assert isinstance(local_view, _MockRdmaMemoryView), (
+            f"write() requires an immutable view (RdmaMemoryView), got "
+            f"{type(local_view).__name__}; use to_view()"
+        )
+        assert isinstance(remote_buffer, _MockRdmaRemoteBuffer)
+        dst_mem = _MockRdmaMemory._registry.get(remote_buffer.addr)
+        assert dst_mem is not None, (
+            f"mock write against unregistered addr {remote_buffer.addr}"
+        )
+        nbytes = remote_buffer.nbytes
+        dst_mem.tensor.view(torch.uint8)[:nbytes].copy_(
+            local_view._tensor.view(torch.uint8)[:nbytes]
+        )
+        return 0
 
     @classmethod
     def reset(cls) -> None:
@@ -540,12 +606,43 @@ class TestRDMAPathMocked(TestCase):
                 base64.b64decode(meta[len(_RDMA_META_PREFIX):])
             )
             self.assertIsInstance(decoded, _RDMABootstrapMeta)
-            self.assertEqual(decoded.handshake_host, socket.gethostname())
+            # The advertised host is whatever the transport resolved (a
+            # resolvable hostname, or loopback when it is not resolvable). It
+            # must be non-empty and match the live transport value.
+            self.assertTrue(decoded.handshake_host)
+            self.assertEqual(decoded.handshake_host, transport._handshake_host)
             self.assertGreater(decoded.handshake_port, 0)
             self.assertEqual(decoded.control_buffer_nbytes, 64 * 1024)
             self.assertIsInstance(decoded.control_remote_buffer, _MockRdmaRemoteBuffer)
         finally:
             transport.shutdown()
+
+    def test_handshake_host_override(self) -> None:
+        """An explicit handshake_host is advertised verbatim for cross-host use."""
+        transport = RDMATransport(
+            device=torch.device("cpu"),
+            timeout=timedelta(seconds=10),
+            handshake_host="10.1.2.3",
+        )
+        try:
+            self.assertEqual(transport._handshake_host, "10.1.2.3")
+            decoded = pickle.loads(
+                base64.b64decode(transport.metadata()[len(_RDMA_META_PREFIX):])
+            )
+            self.assertEqual(decoded.handshake_host, "10.1.2.3")
+        finally:
+            transport.shutdown()
+
+    def test_handshake_host_env_override(self) -> None:
+        """TORCHFT_RDMA_HANDSHAKE_HOST is honored when no arg is passed."""
+        with patch.dict("os.environ", {"TORCHFT_RDMA_HANDSHAKE_HOST": "host.example"}):
+            transport = RDMATransport(
+                device=torch.device("cpu"), timeout=timedelta(seconds=10)
+            )
+            try:
+                self.assertEqual(transport._handshake_host, "host.example")
+            finally:
+                transport.shutdown()
 
     def test_snapshot_build_creates_rdma_memory(self) -> None:
         transport = self._new_transport()
@@ -1174,7 +1271,7 @@ class TestRDMAPhase2Locking(_RDMAMockBase):
             local = torch.zeros(gen1_tensor_buf.nbytes, dtype=torch.uint8)
             local_mem = _MockMem(local, cache_reg=False)
             with self.assertRaisesRegex(AssertionError, "unregistered addr"):
-                recv_t.read(local_mem.to_view(), gen1_tensor_buf)
+                recv_t.read(local_mem.to_mutable_view(), gen1_tensor_buf)
         finally:
             transport.shutdown()
 
