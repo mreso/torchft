@@ -26,6 +26,7 @@ Use --help to see all knobs.
 
 import argparse
 import logging
+import math
 import multiprocessing as mp
 import os
 import random
@@ -88,6 +89,186 @@ class SmallCNN(nn.Module):
         return self.fc2(x)
 
 
+def build_model(model_name: str, num_classes: int = 10) -> nn.Module:
+    """Construct the training model.
+
+    ``smallcnn`` is the tiny default (a few MB — checkpoint transfer is
+    negligible, recovery time is dominated by quorum/timeout overhead).
+    ``resnet50`` is a ~25M-param model (~98 MB fp32 weights; with SGD momentum
+    the checkpoint is ~196 MB) so the RDMA vs HTTP bulk-transfer difference is
+    actually measurable. The torchvision ResNet-50 is adapted for 32x32 CIFAR
+    input with the standard CIFAR stem (3x3 stride-1 conv, no max-pool) so the
+    spatial map isn't collapsed before it reaches the residual stages.
+    """
+    if model_name == "smallcnn":
+        return SmallCNN(num_classes)
+    if model_name == "resnet50":
+        m = torchvision.models.resnet50(weights=None, num_classes=num_classes)
+        m.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        m.maxpool = nn.Identity()
+        return m
+    if model_name in LLAMA_CONFIGS:
+        return LlamaLM(LLAMA_CONFIGS[model_name])
+    raise ValueError(
+        f"unknown --model {model_name!r} "
+        f"(smallcnn|resnet50|{'|'.join(LLAMA_CONFIGS)})"
+    )
+
+
+def is_lm_model(model_name: str) -> bool:
+    return model_name in LLAMA_CONFIGS
+
+
+# ---------------------------------------------------------------------------
+# Self-contained Llama-style decoder (no transformers/torchtitan dependency).
+# RMSNorm + RoPE + (optional GQA) attention via SDPA + SwiGLU MLP. Random init
+# — this is a *checkpoint-transfer* benchmark (RDMA GPUDirect vs HTTP), not a
+# convergence run, so weights/data are synthetic. ``llama_7b`` is the standard
+# Llama-2 7B shape (~6.7B params; bf16 checkpoint ≈ params + SGD momentum ≈
+# 27 GB), large enough that bulk transfer dominates recovery time.
+# ---------------------------------------------------------------------------
+LLAMA_CONFIGS: Dict[str, Dict[str, int]] = {
+    "llama_1b": dict(
+        dim=2048, n_layers=16, n_heads=16, n_kv_heads=16,
+        intermediate=5632, vocab=32000, max_seq=2048,
+    ),
+    "llama_7b": dict(
+        dim=4096, n_layers=32, n_heads=32, n_kv_heads=32,
+        intermediate=11008, vocab=32000, max_seq=2048,
+    ),
+}
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dt = x.dtype
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (xf.to(dt)) * self.weight
+
+
+def _precompute_rope(head_dim: int, seq: int, theta: float = 10000.0):
+    inv = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    t = torch.arange(seq).float()
+    freqs = torch.outer(t, inv)  # [seq, head_dim/2]
+    emb = torch.cat([freqs, freqs], dim=-1)  # [seq, head_dim]
+    return emb.cos(), emb.sin()
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def _apply_rope(q, k, cos, sin):
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    q = q * cos + _rotate_half(q) * sin
+    k = k * cos + _rotate_half(k) * sin
+    return q, k
+
+
+class LlamaAttention(nn.Module):
+    def __init__(self, cfg: Dict[str, int]) -> None:
+        super().__init__()
+        self.n_heads = cfg["n_heads"]
+        self.n_kv = cfg["n_kv_heads"]
+        self.head_dim = cfg["dim"] // cfg["n_heads"]
+        self.wq = nn.Linear(cfg["dim"], self.n_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(cfg["dim"], self.n_kv * self.head_dim, bias=False)
+        self.wv = nn.Linear(cfg["dim"], self.n_kv * self.head_dim, bias=False)
+        self.wo = nn.Linear(self.n_heads * self.head_dim, cfg["dim"], bias=False)
+
+    def forward(self, x, cos, sin):
+        B, T, _ = x.shape
+        q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.wk(x).view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
+        v = self.wv(x).view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
+        q, k = _apply_rope(q, k, cos, sin)
+        if self.n_kv != self.n_heads:
+            rep = self.n_heads // self.n_kv
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        o = o.transpose(1, 2).contiguous().view(B, T, -1)
+        return self.wo(o)
+
+
+class LlamaMLP(nn.Module):
+    def __init__(self, cfg: Dict[str, int]) -> None:
+        super().__init__()
+        self.w1 = nn.Linear(cfg["dim"], cfg["intermediate"], bias=False)  # gate
+        self.w3 = nn.Linear(cfg["dim"], cfg["intermediate"], bias=False)  # up
+        self.w2 = nn.Linear(cfg["intermediate"], cfg["dim"], bias=False)  # down
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class LlamaBlock(nn.Module):
+    def __init__(self, cfg: Dict[str, int]) -> None:
+        super().__init__()
+        self.attn = LlamaAttention(cfg)
+        self.mlp = LlamaMLP(cfg)
+        self.n1 = RMSNorm(cfg["dim"])
+        self.n2 = RMSNorm(cfg["dim"])
+
+    def forward(self, x, cos, sin):
+        x = x + self.attn(self.n1(x), cos, sin)
+        x = x + self.mlp(self.n2(x))
+        return x
+
+
+class LlamaLM(nn.Module):
+    def __init__(self, cfg: Dict[str, int]) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.tok = nn.Embedding(cfg["vocab"], cfg["dim"])
+        self.blocks = nn.ModuleList(
+            [LlamaBlock(cfg) for _ in range(cfg["n_layers"])]
+        )
+        self.norm = RMSNorm(cfg["dim"])
+        self.head = nn.Linear(cfg["dim"], cfg["vocab"], bias=False)
+        head_dim = cfg["dim"] // cfg["n_heads"]
+        cos, sin = _precompute_rope(head_dim, cfg["max_seq"])
+        # Non-persistent: recomputable from config, kept out of the state_dict
+        # so the checkpoint is pure weights (no constant rope tables to ship).
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        _, T = idx.shape
+        x = self.tok(idx)
+        cos = self.rope_cos[:T].to(x.dtype)
+        sin = self.rope_sin[:T].to(x.dtype)
+        for b in self.blocks:
+            x = b(x, cos, sin)
+        x = self.norm(x)
+        return self.head(x)
+
+
+class SyntheticTokens(Dataset):
+    """Random next-token sequences. Deterministic per index (spawn-safe)."""
+
+    def __init__(self, length: int, seq_len: int, vocab: int) -> None:
+        self.length = length
+        self.seq_len = seq_len
+        self.vocab = vocab
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int):
+        g = torch.Generator().manual_seed(idx)
+        ids = torch.randint(0, self.vocab, (self.seq_len + 1,), generator=g)
+        return ids[:-1], ids[1:]
+
+
 # ---------------------------------------------------------------------------
 # Synthetic CIFAR-shaped dataset (used when real CIFAR-10 isn't on disk).
 # Each class has a fixed prototype 3x32x32 tensor; samples are prototype +
@@ -143,7 +324,30 @@ def _try_real_cifar(train_tf, test_tf):
         return None
 
 
-def make_loaders(batch_size: int, replica_id: int, num_replicas: int):
+def make_loaders(
+    batch_size: int,
+    replica_id: int,
+    num_replicas: int,
+    model_name: str = "smallcnn",
+    seq_len: int = 256,
+):
+    # Language-model task: synthetic next-token sequences (no tokenizer / no
+    # download). Each replica gets a disjoint shard via a per-replica index
+    # offset so sequences differ across replicas.
+    if is_lm_model(model_name):
+        vocab = LLAMA_CONFIGS[model_name]["vocab"]
+        trainset = SyntheticTokens(length=100_000, seq_len=seq_len, vocab=vocab)
+        test_set = SyntheticTokens(length=256, seq_len=seq_len, vocab=vocab)
+        gen = torch.Generator().manual_seed(1000 + replica_id)
+        train_loader = DataLoader(
+            trainset, batch_size=batch_size, shuffle=True,
+            num_workers=0, drop_last=True, generator=gen,
+        )
+        test_loader = DataLoader(
+            test_set, batch_size=batch_size, shuffle=False, num_workers=0
+        )
+        return train_loader, test_loader, False
+
     train_tf = transforms.Compose(
         [
             transforms.RandomCrop(32, padding=4),
@@ -187,13 +391,40 @@ def make_loaders(batch_size: int, replica_id: int, num_replicas: int):
     return train_loader, test_loader, using_real
 
 
-def evaluate(model: nn.Module, loader: DataLoader, max_batches: int = 8) -> float:
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    max_batches: int = 8,
+    device: object = None,
+    is_lm: bool = False,
+) -> float:
     model.eval()
-    correct, total = 0, 0
     with torch.no_grad():
+        if is_lm:
+            # Report a (0,1] pseudo-score = exp(-mean CE) so the harness's
+            # "higher is better / improved" logic stays coherent; the raw LM
+            # loss is logged separately via EVT_STEP.
+            tot, n = 0.0, 0
+            for i, (x, y) in enumerate(loader):
+                if i >= max_batches:
+                    break
+                x = x.to(device)
+                y = y.to(device)
+                logits = model(x)
+                loss = F.cross_entropy(
+                    logits.float().view(-1, logits.size(-1)), y.view(-1)
+                )
+                tot += float(loss.item())
+                n += 1
+            model.train()
+            return math.exp(-(tot / max(1, n)))
+        correct, total = 0, 0
         for i, (x, y) in enumerate(loader):
             if i >= max_batches:
                 break
+            if device is not None:
+                x = x.to(device)
+                y = y.to(device)
             out = model(x)
             pred = out.argmax(dim=1)
             correct += (pred == y).sum().item()
@@ -219,6 +450,12 @@ def worker_main(
     manager_min_replica_size: int,
     seed: int,
     cluster_step,  # mp.Value('i') shared with the parent
+    device_type: str = "cpu",
+    transport_mode: str = "rdma",
+    model_name: str = "smallcnn",
+    seq_len: int = 256,
+    grad_sync_every: int = 1,
+    max_gpu_snapshot_gb: float = 4.0,
 ) -> None:
     # `spawn` workers don't inherit the parent's cwd in sys.path, so the
     # bundled site-packages torchft (which lacks rdma_transport) wins over
@@ -235,13 +472,20 @@ def worker_main(
         ProcessGroupGloo,
     )
     from torchft.checkpointing.rdma_transport import RDMATransport
+    from torchft.checkpointing.http_transport import HTTPTransport
 
     logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, force=True)
     log = logging.getLogger(f"replica-{replica_id}")
     random.seed(seed + replica_id)
     torch.manual_seed(seed + replica_id)
 
-    device = torch.device("cpu")
+    if device_type == "cuda":
+        # One replica per GPU: replica i -> cuda:i.
+        torch.cuda.set_device(replica_id)
+        device = torch.device(f"cuda:{replica_id}")
+        log.info("using device %s for replica %d", device, replica_id)
+    else:
+        device = torch.device("cpu")
 
     # Per-worker TCPStore so dist init in Manager has somewhere to publish.
     store = dist.TCPStore(
@@ -251,9 +495,21 @@ def worker_main(
         wait_for_workers=False,
     )
 
-    model = SmallCNN().to(device)
+    is_lm = is_lm_model(model_name)
+    model = build_model(model_name).to(device)
+    if is_lm and device.type == "cuda":
+        # bf16 keeps a 7B model + grads + SGD momentum well within one MI300X
+        # while still producing a ~27 GB checkpoint for the transfer benchmark.
+        model = model.to(torch.bfloat16)
+    log.info(
+        "model=%s params=%d dtype=%s",
+        model_name,
+        sum(p.numel() for p in model.parameters()),
+        next(model.parameters()).dtype,
+    )
+    lr = 1e-3 if is_lm else 0.05
     base_opt = optim.SGD(
-        model.parameters(), lr=0.05, momentum=0.9, weight_decay=5e-4
+        model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=total_steps)
     criterion = nn.CrossEntropyLoss()
@@ -265,18 +521,54 @@ def worker_main(
             "scheduler": scheduler.state_dict(),
         }
 
+    # Holds the wall-clock start of the quorum/heal that is currently in
+    # flight (set right before optimizer.zero_grad()). load_state_dict runs
+    # synchronously inside that call, so (now - t0) is the end-to-end recovery
+    # latency: quorum + checkpoint transfer (over RDMA or HTTP) + apply.
+    heal_timer = {"t0": None}
+
     def load_state_dict(sd: Dict[str, object]) -> None:
         model.load_state_dict(sd["model"])
         base_opt.load_state_dict(sd["optim"])
         scheduler.load_state_dict(sd["scheduler"])
         log.info("loaded state from peer (model + optim + scheduler restored)")
+        t0 = heal_timer.get("t0")
+        heal_secs = (time.monotonic() - t0) if t0 is not None else float("nan")
         try:
-            event_q.put({"type": EVT_HEAL, "replica": replica_id, "step": manager.current_step()})
+            event_q.put({
+                "type": EVT_HEAL,
+                "replica": replica_id,
+                "step": manager.current_step(),
+                "heal_secs": heal_secs,
+                "transport": transport_mode,
+            })
         except Exception:
             pass
 
     pg = ProcessGroupGloo(timeout=timedelta(seconds=30))
-    transport = RDMATransport(device=device, timeout=timedelta(seconds=30))
+    if transport_mode == "http":
+        transport = HTTPTransport(timeout=timedelta(seconds=30), num_chunks=0)
+        rdma_active = False
+    else:
+        transport = RDMATransport(
+            device=device,
+            timeout=timedelta(seconds=30),
+            # Keep large snapshots resident on the GPU so the RDMA read path is
+            # GPU->GPU (GPUDirect), not spilled to pinned CPU. Needed for big
+            # LM checkpoints; harmless for small models.
+            max_gpu_snapshot_bytes=int(max_gpu_snapshot_gb * (1 << 30)),
+        )
+        # _fallback is set (non-None) only when torchcomms RDMA was unavailable
+        # and the transport silently downgraded to HTTP. Assert real RDMA so a
+        # misconfigured run (missing NCCL_IB_GID_INDEX etc.) fails loudly
+        # instead of quietly measuring HTTP.
+        rdma_active = getattr(transport, "_fallback", None) is None
+        if not rdma_active:
+            log.error(
+                "RDMA requested but transport fell back to HTTP "
+                "(RdmaTransport.supported() is False) — check NCCL_IB_GID_INDEX / env"
+            )
+    log.info("transport=%s rdma_active=%s", transport_mode, rdma_active)
 
     # port=0 lets the OS pick a free port on every (re)spawn; this avoids
     # TIME_WAIT collisions when a chaos kill is followed by an immediate
@@ -311,7 +603,13 @@ def worker_main(
         os.getpid(),
     )
     try:
-        event_q.put({"type": EVT_READY, "replica": replica_id, "healed": healed})
+        event_q.put({
+            "type": EVT_READY,
+            "replica": replica_id,
+            "healed": healed,
+            "transport": transport_mode,
+            "rdma_active": rdma_active,
+        })
     except Exception:
         pass
 
@@ -331,9 +629,12 @@ def worker_main(
     optimizer = Optimizer(manager, base_opt)
 
     train_loader, test_loader, using_real = make_loaders(
-        batch_size, replica_id, num_replicas
+        batch_size, replica_id, num_replicas, model_name, seq_len
     )
-    log.info("dataset: %s CIFAR-10", "real" if using_real else "synthetic")
+    if is_lm:
+        log.info("dataset: synthetic tokens (seq_len=%d)", seq_len)
+    else:
+        log.info("dataset: %s CIFAR-10", "real" if using_real else "synthetic")
 
     last_loss = float("nan")
     try:
@@ -348,6 +649,9 @@ def worker_main(
                 # (e.g. a chaos kill) doesn't kill this worker; the next
                 # iteration will trigger a fresh quorum.
                 try:
+                    # Mark the start of this step's quorum so load_state_dict
+                    # can report end-to-end recovery latency if a heal fires here.
+                    heal_timer["t0"] = time.monotonic()
                     # zero_grad triggers start_quorum, which (with
                     # use_async_quorum=False) synchronously heals from a peer
                     # if this worker is behind — restoring model/optim state
@@ -361,8 +665,16 @@ def worker_main(
                     step = manager.current_step()
                     if step >= total_steps:
                         break
-                    out = model(x)
-                    loss = criterion(out, y)
+                    x = x.to(device, non_blocking=True)
+                    y = y.to(device, non_blocking=True)
+                    if is_lm:
+                        logits = model(x)
+                        loss = F.cross_entropy(
+                            logits.float().view(-1, logits.size(-1)), y.view(-1)
+                        )
+                    else:
+                        out = model(x)
+                        loss = criterion(out, y)
                     loss.backward()
                     # Cross-replica gradient averaging via the Manager. If the
                     # quorum is broken (e.g. a peer was just killed), the
@@ -371,20 +683,42 @@ def worker_main(
                     # step. The next iteration's `zero_grad()` will trigger a
                     # fresh quorum and clear the manager's error state.
                     #
-                    # Flatten all grads into one buffer so this is a single
-                    # collective per step instead of one per parameter — much
-                    # cheaper on CPU/Gloo and keeps step time low enough that
-                    # chaos timing stays meaningful.
+                    # The cross-replica allreduce runs over ProcessGroupGloo
+                    # (CPU-only), so grads are staged through CPU. For a 7B model
+                    # that is ~14 GB through CPU/Gloo per step, which would
+                    # dwarf step time and make the chaos/recovery benchmark
+                    # impractical — so for the LM task we sync only every
+                    # ``grad_sync_every`` steps (0 = never; weight averaging
+                    # disabled — this is a checkpoint-transfer benchmark, not a
+                    # convergence run) and run a tiny proxy collective on the
+                    # other steps so the Manager can still detect peer failure
+                    # and drive should_commit. Vision keeps full sync every step.
+                    sync_now = (
+                        True
+                        if not is_lm
+                        else (grad_sync_every > 0 and step % grad_sync_every == 0)
+                    )
                     grads = [p.grad for p in model.parameters() if p.grad is not None]
-                    if grads:
-                        flat = torch.cat([g.detach().view(-1) for g in grads])
+                    if sync_now and grads:
+                        # Model + checkpoint stay on GPU, so the RDMA recovery
+                        # path still exercises GPUDirect; only the grad sync is
+                        # staged through CPU (Gloo limitation).
+                        flat = torch.cat(
+                            [g.detach().float().view(-1) for g in grads]
+                        ).cpu()
                         work = manager.allreduce(flat)
                         work.wait()
+                        flat = flat.to(device)
                         offset = 0
                         for g in grads:
                             n = g.numel()
-                            g.copy_(flat[offset : offset + n].view_as(g))
+                            g.copy_(flat[offset : offset + n].view_as(g).to(g.dtype))
                             offset += n
+                    else:
+                        # Tiny managed collective: keeps the Manager's quorum /
+                        # failure-detection / commit accounting alive without a
+                        # multi-GB CPU transfer.
+                        manager.allreduce(torch.zeros(1)).wait()
                     optimizer.step()
                     new_step = manager.current_step()
                     if new_step > step:
@@ -426,7 +760,7 @@ def worker_main(
                     )
 
                 if step > 0 and step % eval_every == 0:
-                    acc = evaluate(model, test_loader)
+                    acc = evaluate(model, test_loader, device=device, is_lm=is_lm, max_batches=(2 if is_lm else 8))
                     event_q.put(
                         {
                             "type": EVT_EVAL,
@@ -442,7 +776,7 @@ def worker_main(
         raise
     finally:
         try:
-            final_acc = evaluate(model, test_loader)
+            final_acc = evaluate(model, test_loader, device=device, is_lm=is_lm, max_batches=(2 if is_lm else 8))
         except Exception:
             final_acc = float("nan")
         event_q.put(
@@ -458,6 +792,16 @@ def worker_main(
             manager.shutdown(wait=False)
         except Exception:
             pass
+        # torchcomms holds folly Singletons (CtranIbSingleton / RegCache) that
+        # abort the process during atexit teardown if any RDMA-registered
+        # memory is still referenced. Flush the event queue and hard-exit to
+        # bypass that crash (it would otherwise mark a clean worker as failed).
+        try:
+            event_q.close()
+            event_q.join_thread()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +821,12 @@ def spawn_worker(
     manager_min_replica_size: int,
     seed: int,
     cluster_step,
+    device_type: str = "cpu",
+    transport_mode: str = "rdma",
+    model_name: str = "smallcnn",
+    seq_len: int = 256,
+    grad_sync_every: int = 1,
+    max_gpu_snapshot_gb: float = 4.0,
 ) -> mp.Process:
     p = mp.Process(
         target=worker_main,
@@ -495,6 +845,12 @@ def spawn_worker(
             manager_min_replica_size,
             seed,
             cluster_step,
+            device_type,
+            transport_mode,
+            model_name,
+            seq_len,
+            grad_sync_every,
+            max_gpu_snapshot_gb,
         ),
         daemon=False,
     )
@@ -653,6 +1009,49 @@ def supervisor(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--num-replicas", type=int, default=4)
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="device for model + checkpoint staging; 'cuda' puts replica i on cuda:i",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["rdma", "http"],
+        default="rdma",
+        help="checkpoint/recovery transport: rdma (torchcomms RDMA) or http",
+    )
+    parser.add_argument(
+        "--model",
+        choices=["smallcnn", "resnet50", "llama_1b", "llama_7b"],
+        default="smallcnn",
+        help="model to train; resnet50 (~196 MB) and llama_7b (~27 GB bf16 "
+        "checkpoint) make the RDMA-GPUDirect vs HTTP transfer cost measurable",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=256,
+        help="sequence length for the LM task (llama_* models)",
+    )
+    parser.add_argument(
+        "--grad-sync-every",
+        type=int,
+        default=1,
+        help="cross-replica grad-average interval. 1 = every step (vision "
+        "default). For large LMs the grad allreduce goes through CPU/Gloo and "
+        "is huge, so use 0 (never; weight-averaging off — transfer benchmark) "
+        "or a large N. A tiny proxy collective runs on non-sync steps so the "
+        "Manager still detects failures and heals.",
+    )
+    parser.add_argument(
+        "--max-gpu-snapshot-gb",
+        type=float,
+        default=4.0,
+        help="max GPU-resident checkpoint snapshot before spilling to pinned "
+        "CPU. Raise it (e.g. 40) for big LM checkpoints so the RDMA read stays "
+        "GPU->GPU (GPUDirect) instead of CPU-staged",
+    )
     parser.add_argument("--total-steps", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-every", type=int, default=50)
@@ -747,6 +1146,12 @@ def main() -> int:
             args.manager_min_replica_size,
             args.seed,
             cluster_step,
+            args.device,
+            args.transport,
+            args.model,
+            args.seq_len,
+            args.grad_sync_every,
+            args.max_gpu_snapshot_gb,
         )
 
     for rid in range(args.num_replicas):
@@ -816,6 +1221,8 @@ def main() -> int:
     heal_count = 0
     error_count = 0
     ready_count = 0
+    heal_secs_list: List[float] = []  # end-to-end recovery latencies (s)
+    rdma_active_seen = None  # set from EVT_READY: did workers use real RDMA?
     last_print = time.time()
 
     def all_dead() -> bool:
@@ -859,17 +1266,28 @@ def main() -> int:
                     )
                 elif t == EVT_HEAL:
                     heal_count += 1
+                    secs = ev.get("heal_secs", float("nan"))
+                    if secs == secs and secs > 0:  # not NaN
+                        heal_secs_list.append(secs)
                     log.warning(
-                        "HEAL: replica %d restored from peer at step=%s",
+                        "HEAL: replica %d restored from peer at step=%s "
+                        "via %s in %.3fs",
                         rid,
                         ev.get("step", "unknown"),
+                        ev.get("transport", "?"),
+                        secs,
                     )
                 elif t == EVT_READY:
                     ready_count += 1
+                    if ev.get("rdma_active") is not None:
+                        rdma_active_seen = ev.get("rdma_active")
                     log.info(
-                        "READY: replica %d (healed=%s) — total ready events: %d",
+                        "READY: replica %d (healed=%s, transport=%s, rdma_active=%s)"
+                        " — total ready events: %d",
                         rid,
                         ev.get("healed"),
+                        ev.get("transport"),
+                        ev.get("rdma_active"),
                         ready_count,
                     )
                 elif t == EVT_DONE:
@@ -1003,9 +1421,25 @@ def main() -> int:
         print("latest eval step:      N/A")
     print(f"latest eval acc:       {latest_eval_acc:.4f}")
     print(f"best test accuracy:    {best_acc:.4f}")
+    print(f"device:                {args.device}")
+    print(f"model:                 {args.model}")
+    print(f"transport:             {args.transport}")
+    print(f"rdma active:           {rdma_active_seen}")
     print(f"chaos kills:           {chaos_crashes}")
     print(f"cascade respawns:      {cascade_respawns}")
     print(f"successful heals:      {heal_count}")
+    if heal_secs_list:
+        import statistics as _stats
+        _mean = _stats.mean(heal_secs_list)
+        _median = _stats.median(heal_secs_list)
+        _mn, _mx = min(heal_secs_list), max(heal_secs_list)
+        print(
+            f"recovery time (s):     mean={_mean:.3f} median={_median:.3f} "
+            f"min={_mn:.3f} max={_mx:.3f}  (n={len(heal_secs_list)})"
+        )
+        print(f"recovery samples (s):  {[round(s, 3) for s in heal_secs_list]}")
+    else:
+        print("recovery time (s):     no timed heals recorded")
     print(f"transient errors:      {error_count}")
     print(f"accuracy improved:     {improved}")
     print(f"enough chaos events:   {enough_chaos} (need >= {min_expected_kills})")

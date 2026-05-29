@@ -2647,6 +2647,15 @@ class _FakeCudaModule:
         self.log: List[str] = []
         self.events: List[_FakeCudaEvent] = []
 
+    def set_device(self, device: object) -> None:
+        # Used by ``_restore_cuda_device`` (and send/recv) to re-pin HIP's
+        # current device after RDMA registration on ROCm. A no-op for the fake;
+        # logged so ordering can be inspected if needed.
+        self.log.append("set_device")
+
+    def synchronize(self, device: object = None) -> None:
+        self.log.append("synchronize")
+
     def Stream(self) -> _FakeCudaStream:  # noqa: N802 - mirrors torch API
         return _FakeCudaStream(self.log)
 

@@ -216,6 +216,14 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         handshake_host: Optional[str] = None,
         max_transfer_seconds: float = _DEFAULT_MAX_TRANSFER_SECONDS,
     ) -> None:
+        # Normalize a bare ``cuda`` (index=None) device to an explicit
+        # ``cuda:N``. The background quorum thread calls
+        # ``torch.cuda.set_device(self._device)`` and ``torch.cuda.synchronize(
+        # self._device)``; both raise ``ValueError`` for an index-less device.
+        # Pinning the index here also keeps the per-tensor ``_same_device``
+        # checks unambiguous on a multi-GPU node.
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         self._device = device
         self._timeout = timeout
         self._state_dict_fn = state_dict
@@ -263,8 +271,11 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             dtype=torch.uint8,
             pin_memory=(self._device.type == "cuda"),
         )
+        # cache_reg=False: auto-register this buffer with the RegCache now.
+        # (cache_reg=True asserts the buffer is *already* registered, which it
+        # isn't here — current torchcomms RdmaMemory throws in that case.)
         self._control_mem: Optional[object] = RdmaMemory(
-            self._control_tensor, cache_reg=True
+            self._control_tensor, cache_reg=False
         )
         self._control_remote_buffer = self._control_mem.to_remote_buffer()
 
@@ -326,7 +337,63 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         )
         self._handshake_thread.start()
 
+        # Construction registered GPU/NIC memory (and the GDR probe deregistered
+        # a buffer); on ROCm those torchcomms ops change HIP's *current device*
+        # out from under PyTorch. Restore it so the caller's next CUDA op (e.g.
+        # building the very first state_dict) lands on the right device instead
+        # of failing with hipErrorInvalidValue. See ``_restore_cuda_device``.
+        self._restore_cuda_device()
+
         self._rdma = True
+
+    def _restore_cuda_device(self) -> None:
+        """Re-pin this transport's CUDA device after torchcomms RDMA ops.
+
+        torchcomms RDMA memory registration / deregistration (the ``RegCache``
+        / GDR path) perturbs HIP's per-thread *current device* out from under
+        PyTorch: PyTorch keeps its cached current device, so a subsequent kernel
+        launch fails with ``CUDA error: invalid argument``
+        (``hipErrorInvalidValue``) even though ``torch.cuda.synchronize``
+        reports clean (sync does not re-issue ``hipSetDevice``).
+
+        Two wrinkles make a bare ``set_device`` insufficient on ROCm:
+
+        * the perturbation surfaces only on the *next kernel launch*, and it can
+          land slightly *after* the registering call returns, so the failing
+          launch may be the caller's first real op rather than anything here;
+        * once that one launch has failed, a ``set_device`` clears the state for
+          good.
+
+        So we actively *trigger and absorb* the pending failure with throwaway
+        kernel launches, re-pinning the device between attempts, until a launch
+        succeeds. This guarantees the caller's next CUDA op runs clean. No-op on
+        CPU. CUDA's current device is per-host-thread, so this only fixes the
+        thread that performed the RDMA ops (construction thread, or the quorum
+        background thread for send/recv).
+        """
+        if self._device.type != "cuda":
+            return
+        last_err: Optional[BaseException] = None
+        for _ in range(8):
+            try:
+                torch.cuda.set_device(self._device)
+                # Throwaway *kernel launch* (not just an allocation — alloc
+                # alone does not launch a kernel and so never trips the
+                # perturbation): if the device was perturbed this raises,
+                # absorbing the sticky state; otherwise it confirms the device
+                # is clean.
+                torch.arange(1, device=self._device) + 1
+                torch.cuda.synchronize(self._device)
+                return
+            except Exception as e:  # noqa: BLE001 - absorb + retry
+                last_err = e
+                logger.debug("restore: absorbing stray CUDA error: %r", e)
+        logger.warning(
+            "RDMATransport could not restore CUDA device %s after RDMA op; "
+            "last error: %r",
+            self._device,
+            last_err,
+        )
 
     def _resolve_handshake_host(self) -> str:
         """Pick the address peers should use to reach the handshake server.
@@ -394,6 +461,13 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             # Register and immediately drop it. Success means GDR registration
             # works for this device; that is the only thing we assert here.
             RdmaMemory(probe_tensor, cache_reg=False)
+            # On ROCm, registering + deregistering this GPU buffer moves HIP's
+            # current device out from under PyTorch (see _restore_cuda_device).
+            # Re-pin it so the rest of __init__ — and the final restore — run on
+            # the right device. (synchronize alone does NOT fix this: it does
+            # not re-issue hipSetDevice, so the next kernel launch would still
+            # fail with hipErrorInvalidValue.)
+            self._restore_cuda_device()
             logger.info(
                 "RDMATransport GDR registration probe succeeded on %s; GPU "
                 "tensors stay on GPU (subject to max_gpu_snapshot_bytes)",
@@ -458,6 +532,14 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             self._fallback.send_checkpoint(dst_ranks, step, state_dict, timeout)
             return
 
+        # send_checkpoint runs in the Manager's quorum *background thread*, which
+        # does not inherit the worker's torch.cuda.set_device(). Pin it to this
+        # transport's device so the copy stream / clones / RDMA registration all
+        # target the right GPU (otherwise cross-device ops raise
+        # "CUDA error: invalid argument").
+        if self._device.type == "cuda":
+            torch.cuda.set_device(self._device)
+
         with _timeit("rdma: preparing state_dict"):
             sd_meta, tensors = _prepare_state_dict(state_dict, step, self._device)
 
@@ -477,6 +559,11 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
 
         self._update_control_record(step, "READY", snapshot)
         self._allow_checkpoint(step)
+
+        # Building the snapshot registered new RDMA memory and dropping the
+        # previous generation deregistered its buffers; on ROCm those ops move
+        # HIP's current device. Restore it before returning to the caller.
+        self._restore_cuda_device()
 
     def recv_checkpoint(
         self,
@@ -511,6 +598,11 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
                 f"prefix but got {metadata[:32]!r}; remote peer is using a "
                 "different transport"
             )
+
+        # recv_checkpoint also runs in the Manager's quorum background thread;
+        # pin the CUDA device for the same reason as send_checkpoint.
+        if self._device.type == "cuda":
+            torch.cuda.set_device(self._device)
 
         from torchcomms._transport import (  # type: ignore[import-not-found]
             RdmaTransport as _RdmaTransport,
@@ -559,6 +651,10 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
                 sock.close()
             except Exception:
                 pass
+            # The per-tensor RDMA reads registered and deregistered many local
+            # buffers; on ROCm that moves HIP's current device. Restore it
+            # before handing the reconstructed state back to the caller.
+            self._restore_cuda_device()
 
         return tree_unflatten(values, manifest.treespec)
 
@@ -672,6 +768,14 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         # directly with the NIC, so EVERY GPU tensor must be staged through
         # pinned CPU regardless of the GPU snapshot budget (B3).
         force_spill = not getattr(self, "_gdr_ok", True)
+        # ROCm note: ``RdmaMemory(...)`` registration perturbs HIP's current
+        # device so the *next* CUDA kernel launch fails (hipErrorInvalidValue;
+        # see ``_restore_cuda_device``). We therefore run all the kernel work
+        # (clones / D2H spills) FIRST, in a single pass with no registration
+        # interleaved, then register every buffer in a second pass that issues
+        # no kernels, and finally restore the device once. Interleaving a clone
+        # after a registration (the original single-loop form) made every
+        # tensor after the first fail.
         with stream_ctx:
             for t in tensors:
                 if t.device.type == "cuda":
@@ -695,15 +799,22 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
                         gpu_snapshot_bytes += t_bytes
                 else:
                     cloned.append(t.clone().contiguous())
-                tensor_mems.append(RdmaMemory(cloned[-1], cache_reg=False))
 
         # Record the fence event on the copy stream after all snapshot copies
-        # have been enqueued. The publishing path must wait on it before any
-        # READY control-record write becomes visible to receivers.
+        # have been enqueued (device still clean — no registration yet). The
+        # publishing path must wait on it before any READY control-record write
+        # becomes visible to receivers.
         cuda_event: object = None
         if is_cuda:
             cuda_event = torch.cuda.Event()
             cuda_event.record(copy_stream)
+
+        # Second pass: register every cloned/spilled buffer. No CUDA kernels run
+        # between these registrations, so the ROCm device perturbation cannot
+        # abort anything here; we absorb it once via ``_restore_cuda_device``
+        # below (and again at the end of ``send_checkpoint``).
+        for c in cloned:
+            tensor_mems.append(RdmaMemory(c, cache_reg=False))
 
         # Assemble the manifest with per-tensor RemoteBuffer handles.
         leaves: List[object] = []
@@ -741,6 +852,11 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             bytearray(manifest_bytes), dtype=torch.uint8
         )
         manifest_mem = RdmaMemory(manifest_tensor, cache_reg=False)
+
+        # All registrations done; absorb the ROCm device perturbation so the
+        # caller's downstream CUDA work (event sync, control record, training)
+        # runs on a clean device.
+        self._restore_cuda_device()
 
         return _SnapshotGeneration(
             generation=self._generation,
@@ -797,25 +913,53 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         view[8 : 8 + len(payload)] = bytearray(payload)
         struct.pack_into("<Q", view, 0, len(payload))
 
+    def _rdma_read_to_host(
+        self, transport: object, nbytes: int, remote_buffer: object
+    ) -> bytes:
+        """RDMA-read ``nbytes`` from ``remote_buffer`` and return them as host bytes.
+
+        The torchcomms ``read`` enforces ``CHECK_EQ(cudaDev_,
+        localBuffer->getDevice())`` — the local buffer must live on the same
+        device the transport is bound to. The pybind layer reports *CPU*
+        tensors as device 0 (``RdmaTransportPy.cpp``: "If CPU memory is passed,
+        use device 0 for NIC discovery"), so a CPU local buffer aborts the
+        process whenever the receiver transport is on any GPU other than
+        ``cuda:0`` (multi-GPU recovery). We therefore stage the read through a
+        buffer on ``self._device`` and copy it to the host for unpickling. RDMA
+        registration perturbs HIP's current device on ROCm, so we restore it
+        before the device-to-host copy (which is itself a CUDA op). On the CPU
+        path the read target is a host buffer directly (device 0 matches a CPU
+        transport).
+        """
+        from torchcomms._transport import RdmaMemory  # type: ignore[import-not-found]
+
+        local = torch.empty(nbytes, dtype=torch.uint8, device=self._device)
+        local_mem = RdmaMemory(local, cache_reg=False)
+        # RDMA reads write into the local buffer, so they require a *mutable*
+        # view (RdmaMemoryMutableView). Passing the immutable to_view() here
+        # raises TypeError against the real torchcomms binding.
+        _rdma_read(transport, local_mem.to_mutable_view(), remote_buffer)
+        if self._device.type == "cuda":
+            # Clear the registration's device perturbation before the D2H copy.
+            self._restore_cuda_device()
+            return bytes(local.cpu().numpy())
+        return bytes(local.numpy())
+
     def _read_control_record(
         self,
         transport: object,
         bootstrap: _RDMABootstrapMeta,
         expected_step: int,
     ) -> _RDMAControlRecord:
-        local = torch.zeros(bootstrap.control_buffer_nbytes, dtype=torch.uint8)
-        from torchcomms._transport import RdmaMemory  # type: ignore[import-not-found]
-
-        local_mem = RdmaMemory(local, cache_reg=False)
-        # RDMA reads write into the local buffer, so they require a *mutable*
-        # view (RdmaMemoryMutableView). Passing the immutable to_view() here
-        # raises TypeError against the real torchcomms binding.
-        _rdma_read(transport, local_mem.to_mutable_view(), bootstrap.control_remote_buffer)
-        view = local.numpy()
-        (length,) = struct.unpack_from("<Q", view, 0)
+        raw = self._rdma_read_to_host(
+            transport,
+            bootstrap.control_buffer_nbytes,
+            bootstrap.control_remote_buffer,
+        )
+        (length,) = struct.unpack_from("<Q", raw, 0)
         if length == 0:
             raise RuntimeError("control record is empty")
-        record = pickle.loads(bytes(view[8 : 8 + length]))
+        record = pickle.loads(raw[8 : 8 + length])
         assert isinstance(record, _RDMAControlRecord)
         if record.status != "READY":
             raise RuntimeError(
@@ -833,14 +977,12 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         transport: object,
         control: _RDMAControlRecord,
     ) -> _RDMAManifest:
-        from torchcomms._transport import RdmaMemory  # type: ignore[import-not-found]
-
         if control.manifest_remote_buffer is None:
             raise RuntimeError("control record is READY but has no manifest buffer")
-        local = torch.empty(control.manifest_nbytes, dtype=torch.uint8)
-        local_mem = RdmaMemory(local, cache_reg=False)
-        _rdma_read(transport, local_mem.to_mutable_view(), control.manifest_remote_buffer)
-        manifest = pickle.loads(bytes(local.numpy()))
+        raw = self._rdma_read_to_host(
+            transport, control.manifest_nbytes, control.manifest_remote_buffer
+        )
+        manifest = pickle.loads(raw)
         assert isinstance(manifest, _RDMAManifest)
         return manifest
 
@@ -861,26 +1003,78 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         else:
             dst_lookup = {}
 
-        values: List[object] = []
+        # ROCm note: each ``RdmaMemory(...)`` registration perturbs HIP's current
+        # device so the *next* CUDA op (allocation included) fails. To keep the
+        # per-tensor cost off the hot path for large models (ResNet50 has ~270
+        # tensors), we batch the work into phases that never interleave a kernel
+        # / allocation with a registration:
+        #   A. one device restore, then allocate every receive buffer;
+        #   B. register + RDMA-read every buffer (no kernels between);
+        #   C. one device restore;
+        #   D. assemble return values (views only — no kernels).
+        # This replaces a throwaway-kernel restore *per tensor* with two total.
+
+        # Phase A: restore once (clean device), then resolve/allocate buffers.
+        self._restore_cuda_device()
+        # Each entry: (kind, payload). kind in {"tensor", "dtensor", "value"}.
+        #   tensor:   payload = (buf, meta, remote_buffer)
+        #   dtensor:  payload = (buf, meta, remote_buffer, spec)
+        #   value:    payload = the passthrough object
+        plan: List[tuple] = []
         for path, leaf in zip(manifest.paths, manifest.leaves):
             if isinstance(leaf, _RDMATensorLeaf):
-                values.append(self._read_one_tensor(transport, path, leaf, dst_lookup))
+                buf = self._resolve_recv_buffer(path, leaf, dst_lookup)
+                plan.append(("tensor", (buf, leaf.meta, leaf.remote_buffer)))
             elif isinstance(leaf, _RDMADTensorLeaf):
-                tensor = self._read_one_tensor(transport, path, leaf.local, dst_lookup)
-                values.append(DTensor(tensor, leaf.spec, requires_grad=False))
+                buf = self._resolve_recv_buffer(path, leaf.local, dst_lookup)
+                plan.append(
+                    (
+                        "dtensor",
+                        (buf, leaf.local.meta, leaf.local.remote_buffer, leaf.spec),
+                    )
+                )
             else:
-                values.append(leaf)
+                plan.append(("value", leaf))
+
+        # Phase B: register + read every buffer. No CUDA kernels/allocations run
+        # between registrations, so the ROCm perturbation cannot abort anything.
+        for kind, payload in plan:
+            if kind == "tensor" or kind == "dtensor":
+                buf, _meta, remote_buffer = payload[0], payload[1], payload[2]
+                local_mem = RdmaMemory(buf, cache_reg=False)
+                _rdma_read(transport, local_mem.to_mutable_view(), remote_buffer)
+
+        # Phase C: absorb the registrations' perturbation once.
+        self._restore_cuda_device()
+
+        # Phase D: assemble values (strided views / DTensor wrap — no kernels).
+        values: List[object] = []
+        for kind, payload in plan:
+            if kind == "tensor":
+                buf, meta, _ = payload
+                values.append(self._finalize_recv_tensor(buf, meta))
+            elif kind == "dtensor":
+                buf, meta, _, spec = payload
+                tensor = self._finalize_recv_tensor(buf, meta)
+                values.append(DTensor(tensor, spec, requires_grad=False))
+            else:
+                values.append(payload)
         return values
 
-    def _read_one_tensor(
+    def _resolve_recv_buffer(
         self,
-        transport: object,
         path: KeyPath,
         leaf: _RDMATensorLeaf,
         dst_lookup: Dict[KeyPath, object],
     ) -> torch.Tensor:
-        from torchcomms._transport import RdmaMemory  # type: ignore[import-not-found]
+        """Resolve the uint8 RDMA-read target for one tensor leaf (no read yet).
 
+        Returns either a view over a caller-provided in-place destination
+        (zero-copy receive) or a freshly allocated buffer on ``self._device``.
+        Allocation only — the registration + read happen later in a batch so no
+        registration is interleaved with an allocation (ROCm device
+        perturbation, see ``_read_tensors``).
+        """
         meta = leaf.meta
         inplace = dst_lookup.get(path)
         if isinstance(inplace, torch.Tensor):
@@ -901,12 +1095,13 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             assert buf.nbytes == meta.nbytes, (
                 "in-place tensor storage size must match manifest entry"
             )
-        else:
-            buf = torch.empty(meta.nbytes, dtype=torch.uint8, device=self._device)
+            return buf
+        return torch.empty(meta.nbytes, dtype=torch.uint8, device=self._device)
 
-        local_mem = RdmaMemory(buf, cache_reg=False)
-        _rdma_read(transport, local_mem.to_mutable_view(), leaf.remote_buffer)
-
+    def _finalize_recv_tensor(
+        self, buf: torch.Tensor, meta: _TensorMeta
+    ) -> torch.Tensor:
+        """Reinterpret a read-into uint8 buffer as the original tensor (a view)."""
         return torch.as_strided(
             buf.view(meta.dtype),
             size=meta.shape,
