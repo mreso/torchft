@@ -46,11 +46,11 @@ part most likely to need per-box tuning):
 ### A.1 Repos and branches
 
 ```
-torchcomms   branch: rocm-transport-support     # ROCm transport build fixes
-torchft      branch: feature/rdma_transport_rocm # RDMATransport ROCm fixes + benchmark
+torchcomms   branch: feature/rocm_transport       # ROCm transport build fixes
+torchft      branch: feature/rdma_transport_rocm  # RDMATransport ROCm fixes + benchmark
 ```
 
-The `rocm-transport-support` torchcomms branch carries the ROCm build fixes
+The `feature/rocm_transport` torchcomms branch carries the ROCm build fixes
 (transport-layer enablement, `getCuMemDmaBufFd` via HIP, `HSA_STATUS_SUCCESS` +
 cuda→hip compat macros, header-only fmt linkage). Keep a backup branch before
 rebasing torchcomms onto upstream `main`.
@@ -99,7 +99,7 @@ export NCCL_DEBUG=ERROR GLOG_minloglevel=2   # optional: quieter logs
 ### A.4 Build torchcomms (transport-only, ROCm)
 
 ```bash
-cd torchcomms && git checkout rocm-transport-support
+cd torchcomms && git checkout feature/rocm_transport
 ( cd comms/utils/cvars && NCCL_CVARS_OUTPUT_DIR=$PWD python extractcvars.py )
 
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH \
