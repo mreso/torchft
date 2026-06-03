@@ -266,10 +266,29 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         )
 
         # Long-lived control buffer; one allocation per transport.
+        #
+        # It must be registered on the SAME NIC as the per-peer responder QP
+        # (which lives on this transport's device -> this device's NIC). The
+        # torchcomms pybind registers ANY CPU tensor under cudaDev=0, so on a
+        # multi-NIC node a CPU control buffer would land in NIC0's protection
+        # domain while the responder QP is on this device's NIC -> a peer's RDMA
+        # read of the control record fails with IBV_WC_REM_ACCESS_ERR (the rkey
+        # is rejected by the responder's PD). To avoid that we keep the
+        # RDMA-exposed buffer GPU-resident on self._device (registers under this
+        # device's NIC) and assemble records on a CPU staging buffer that we
+        # H2D-copy in. On a CPU device the buffer stays on CPU (single path).
+        _ctrl_is_cuda = self._device.type == "cuda"
         self._control_tensor: Optional[torch.Tensor] = torch.zeros(
             _CONTROL_BUFFER_NBYTES,
             dtype=torch.uint8,
-            pin_memory=(self._device.type == "cuda"),
+            device=self._device if _ctrl_is_cuda else None,
+        )
+        # CPU buffer used to assemble the record before publishing it to the GPU
+        # control buffer (None on the CPU path, which writes in place).
+        self._control_staging: Optional[torch.Tensor] = (
+            torch.zeros(_CONTROL_BUFFER_NBYTES, dtype=torch.uint8)
+            if _ctrl_is_cuda
+            else None
         )
         # cache_reg=False: auto-register this buffer with the RegCache now.
         # (cache_reg=True asserts the buffer is *already* registered, which it
@@ -457,6 +476,12 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         )
 
         try:
+            # Start from a clean current device: an earlier registration in
+            # __init__ (the GPU control buffer) perturbs HIP's current device on
+            # ROCm, which would otherwise make the probe's allocation/registration
+            # below spuriously fail and wrongly route everything through
+            # pinned-CPU staging.
+            self._restore_cuda_device()
             probe_tensor = torch.zeros(8, dtype=torch.uint8, device=self._device)
             # Register and immediately drop it. Success means GDR registration
             # works for this device; that is the only thing we assert here.
@@ -704,6 +729,7 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
             self._peers.clear()
         self._control_mem = None
         self._control_tensor = None
+        self._control_staging = None
 
     # ------------------------------------------------------------------
     # RDMA-only helpers.
@@ -851,6 +877,14 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         manifest_tensor = torch.frombuffer(
             bytearray(manifest_bytes), dtype=torch.uint8
         )
+        if self._device.type == "cuda":
+            # Register the manifest on THIS device's NIC (same protection domain
+            # as the per-peer responder QP) so a peer's RDMA read doesn't hit
+            # IBV_WC_REM_ACCESS_ERR on a multi-NIC node. The tensor
+            # registrations above perturbed the device; restore before this H2D
+            # copy (a plain memcpy needs a clean current device on ROCm).
+            self._restore_cuda_device()
+            manifest_tensor = manifest_tensor.to(self._device)
         manifest_mem = RdmaMemory(manifest_tensor, cache_reg=False)
 
         # All registrations done; absorb the ROCm device perturbation so the
@@ -908,10 +942,32 @@ class RDMATransport(CheckpointTransport[T], Generic[T]):
         # real length LAST. Because the length is a single aligned 8-byte word,
         # a reader observes either the old (zeroed) or the new length, never a
         # torn value, so it decodes either nothing or the complete new record.
-        view = self._control_tensor.numpy()
-        struct.pack_into("<Q", view, 0, 0)
-        view[8 : 8 + len(payload)] = bytearray(payload)
-        struct.pack_into("<Q", view, 0, len(payload))
+        if self._control_tensor.device.type != "cuda":
+            # CPU buffer: write the registered buffer in place.
+            view = self._control_tensor.numpy()
+            struct.pack_into("<Q", view, 0, 0)
+            view[8 : 8 + len(payload)] = bytearray(payload)
+            struct.pack_into("<Q", view, 0, len(payload))
+            return
+
+        # GPU control buffer: assemble on the CPU staging buffer, then publish
+        # to the GPU buffer keeping the same length-last ordering across two H2D
+        # copies so a peer's RDMA read still sees old-or-complete, never torn.
+        # (A plain memcpy doesn't perturb the ROCm device, but the current
+        # device must be clean for the copy to run -- restore first.)
+        staging = self._control_staging
+        assert staging is not None
+        sview = staging.numpy()
+        struct.pack_into("<Q", sview, 0, 0)  # length = 0
+        sview[8 : 8 + len(payload)] = bytearray(payload)
+        self._restore_cuda_device()
+        # 1) publish payload with the length still 0
+        self._control_tensor.copy_(staging)
+        torch.cuda.synchronize(self._device)
+        # 2) publish the real length word, last
+        struct.pack_into("<Q", sview, 0, len(payload))
+        self._control_tensor[0:8].copy_(staging[0:8])
+        torch.cuda.synchronize(self._device)
 
     def _rdma_read_to_host(
         self, transport: object, nbytes: int, remote_buffer: object
